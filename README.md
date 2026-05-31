@@ -99,6 +99,9 @@
 
 > 📸 _截图将随版本迭代持续更新。_
 
+### QQ群交流
+![gopay注册生成gptplus](assets/screenshots/QQ群交流.jpg)
+
 ### gopay注册生成gptplus
 
 ![gopay注册生成gptplus](assets/screenshots/gopay注册生成gptplus.png)
