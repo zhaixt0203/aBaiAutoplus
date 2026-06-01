@@ -600,6 +600,79 @@ def _auto_upload_cpa(task_logger: TaskLogger, account) -> None:
         task_logger.log(f"  [CPA] 自动上传异常: {exc}", level="warning")
 
 
+def _outlook_mailbox_account_from_platform_account(account) -> Any | None:
+    extra = dict(getattr(account, "extra", {}) or {})
+    resources = list(extra.get("provider_resources") or [])
+    identity = dict(extra.get("identity") or {})
+    if isinstance(identity.get("provider_resource"), dict):
+        resources.append(identity["provider_resource"])
+    for item in resources:
+        if not isinstance(item, dict):
+            continue
+        provider_name = str(item.get("provider_name") or item.get("provider") or "").strip().lower()
+        if provider_name not in {"outlook_email", "outlook_email_api"}:
+            continue
+        handle = str(item.get("handle") or item.get("email") or getattr(account, "email", "") or "").strip()
+        resource_id = str(item.get("resource_identifier") or item.get("account_id") or "").strip()
+        if not handle:
+            continue
+        from core.base_mailbox import MailboxAccount
+
+        return MailboxAccount(
+            email=handle,
+            account_id=resource_id,
+            extra={"provider_resource": item},
+        )
+    return None
+
+
+def _resolve_outlook_mailbox_for_tagging(shared_mailbox, mailbox_account):
+    if shared_mailbox is not None:
+        if hasattr(shared_mailbox, "mark_registration_success") or hasattr(shared_mailbox, "mark_plus_success"):
+            return shared_mailbox
+        resolver = getattr(shared_mailbox, "_resolve_mailbox", None)
+        if callable(resolver):
+            try:
+                resolved = resolver(mailbox_account)
+                if hasattr(resolved, "mark_registration_success") or hasattr(resolved, "mark_plus_success"):
+                    return resolved
+            except Exception:
+                pass
+
+    try:
+        from core.outlook_email_mailbox import OutlookEmailMailbox
+        from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+        settings = ProviderSettingsRepository().resolve_runtime_settings("mailbox", "outlook_email_api", {})
+        if settings.get("outlook_email_api_url") and settings.get("outlook_email_api_key"):
+            return OutlookEmailMailbox.from_config(settings)
+    except Exception:
+        return None
+    return None
+
+
+def _mark_outlook_mailbox_event(shared_mailbox, account, event: str, logger: TaskLogger) -> None:
+    mailbox_account = _outlook_mailbox_account_from_platform_account(account)
+    if mailbox_account is None:
+        return
+    mailbox = _resolve_outlook_mailbox_for_tagging(shared_mailbox, mailbox_account)
+    if mailbox is None:
+        return
+    try:
+        if event == "registration_success":
+            applied = mailbox.mark_registration_success(mailbox_account)
+            label = "注册成功"
+        elif event == "plus_success":
+            applied = mailbox.mark_plus_success(mailbox_account)
+            label = "Plus 开通成功"
+        else:
+            return
+        if applied:
+            logger.log(f"outlookEmail {label}后已打标签: {', '.join(applied)}")
+    except Exception as exc:
+        logger.log(f"outlookEmail 自动打标签失败（忽略）: {exc}", level="warning")
+
+
 def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger: TaskLogger, resolved_proxy: str | None = None, shared_mailbox=None):
     from core.base_identity import normalize_identity_provider
     from core.base_mailbox import create_mailbox
@@ -1134,6 +1207,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 logger.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
             save_account(account)
+            _mark_outlook_mailbox_event(shared_mailbox, account, "registration_success", logger)
             _auto_followup_windsurf_payment(
                 platform_name=platform_name,
                 payload=payload,
@@ -1163,6 +1237,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 elif _is_current_sms_phone_exhausted_error(chatgpt_plus_error):
                     slot_state["swapped_or_dead"] = True
                 return chatgpt_plus_error
+            chatgpt_plus_enabled = (
+                platform_name == "chatgpt"
+                and _bool_config(extra.get("auto_chatgpt_plus_payment"), False)
+            )
+            if chatgpt_plus_enabled:
+                _mark_outlook_mailbox_event(shared_mailbox, account, "plus_success", logger)
             if resolved_proxy:
                 proxy_pool.report_success(resolved_proxy)
             logger.record_success()
@@ -1659,6 +1739,15 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
                 cancel_check=logger.is_cancel_requested,
             )
             logger.log(f"[{index + 1}/{total}] 成功: #{chatgpt_account_id}")
+            if int(chatgpt_account_id or 0) > 0:
+                try:
+                    with Session(engine) as session:
+                        model = session.get(AccountModel, int(chatgpt_account_id))
+                        if model:
+                            marked_account = build_platform_account(session, model)
+                            _mark_outlook_mailbox_event(None, marked_account, "plus_success", logger)
+                except Exception as exc:
+                    logger.log(f"outlookEmail Plus 自动打标签检查失败（忽略）: {exc}", level="warning")
             return {"ok": True, **out}
         except Exception as exc:
             error = str(exc)
@@ -1759,6 +1848,7 @@ def _register_chatgpt_accounts_for_gopay(
             )
             account = platform.register()
             save_account(account)
+            _mark_outlook_mailbox_event(getattr(platform, "mailbox", None), account, "registration_success", logger)
             # save_account 返回的 model 出 session 即 detached，访问 .id 会抛
             # DetachedInstanceError。用 email 重新查一次拿稳定 id。
             with Session(engine) as session:

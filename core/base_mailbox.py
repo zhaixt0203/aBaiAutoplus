@@ -229,6 +229,34 @@ def _create_testmail(extra: dict, proxy: str | None) -> 'BaseMailbox':
     )
 
 
+def _create_outlook_email(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    from core.outlook_email_mailbox import OutlookEmailMailbox
+
+    return OutlookEmailMailbox(
+        api_url=extra.get("outlook_email_api_url", ""),
+        api_key=extra.get("outlook_email_api_key", ""),
+        admin_password=extra.get("outlook_email_admin_password", ""),
+        fixed_email=extra.get("outlook_email_fixed_email", ""),
+        group_id=extra.get("outlook_email_group_id", ""),
+        account_limit=extra.get("outlook_email_account_limit", ""),
+        account_offset=extra.get("outlook_email_account_offset", ""),
+        account_sort_by=extra.get("outlook_email_account_sort_by", ""),
+        account_sort_order=extra.get("outlook_email_account_sort_order", ""),
+        account_tag_ids=extra.get("outlook_email_account_tag_ids", ""),
+        account_include_untagged=extra.get("outlook_email_account_include_untagged", ""),
+        email_folder=extra.get("outlook_email_folder", ""),
+        email_top=extra.get("outlook_email_top", ""),
+        email_subject_contains=extra.get("outlook_email_subject_contains", ""),
+        email_from_contains=extra.get("outlook_email_from_contains", ""),
+        email_keyword=extra.get("outlook_email_keyword", ""),
+        poll_interval=extra.get("outlook_email_poll_interval", ""),
+        skip_tag_names=extra.get("outlook_email_skip_tag_names", ""),
+        register_success_tag_names=extra.get("outlook_email_register_success_tag_names", ""),
+        plus_success_tag_names=extra.get("outlook_email_plus_success_tag_names", ""),
+        proxy=proxy,
+    )
+
+
 def _create_local_ms_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
     from core.local_ms_mailbox import LocalMicrosoftMailboxPool
 
@@ -270,6 +298,7 @@ MAILBOX_FACTORY_REGISTRY = {
     "moemail_api": _create_moemail,
     "cfworker_admin_api": _create_cfworker,
     "testmail_api": _create_testmail,
+    "outlook_email_api": _create_outlook_email,
     "local_ms_pool": _create_local_ms_pool,
     "laoudo_api": _create_laoudo,
     # backward-compat fallback
@@ -281,6 +310,7 @@ MAILBOX_FACTORY_REGISTRY = {
     "moemail": _create_moemail,
     "cfworker": _create_cfworker,
     "testmail": _create_testmail,
+    "outlook_email": _create_outlook_email,
     "local_ms": _create_local_ms_pool,
     "laoudo": _create_laoudo,
 }

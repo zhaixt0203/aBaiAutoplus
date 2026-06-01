@@ -64,7 +64,7 @@
 ## 功能特性
 
 - **多平台支持**：ChatGPT、Cursor、Kiro、Trae.ai、Tavily、Grok、Blink、Cerebras、OpenBlockLabs、Windsurf、GoPay，支持自定义插件扩展（Anything 通用适配器）
-- **多邮箱服务**：MoeMail（自建）、Laoudo、DuckMail、Testmail、Cloudflare Worker 自建邮箱、Freemail、TempMail.lol、Temp-Mail Web、DuckDuckGo Email
+- **多邮箱服务**：MoeMail（自建）、Laoudo、DuckMail、Testmail、outlookEmail、Cloudflare Worker 自建邮箱、Freemail、TempMail.lol、Temp-Mail Web、DuckDuckGo Email
 - **多执行模式**：API 协议（无浏览器）、无头浏览器、有头浏览器（各平台按需支持）
 - **验证码服务**：YesCaptcha、2Captcha、本地 Solver（Camoufox）
 - **接码服务**：SMS-Activate、HeroSMS、SMSPool、SMSBower
@@ -380,6 +380,33 @@ docker compose down         # 停止
 | Namespace  | 你的 namespace，例如 `3xw8n`             |
 | Tag Prefix | 可选，给随机 tag 增加前缀                |
 | API Key    | testmail.app 控制台里的 API Key          |
+
+### outlookEmail
+
+基于 [assast/outlookEmail](https://github.com/assast/outlookEmail) 的 Outlook/Hotmail 邮箱池服务，通过对外 API 读取已有邮箱账号和邮件列表。适合把自有 Outlook 邮箱池作为注册验证码收件源。
+
+| 参数             | 说明                                                                 |
+| ---------------- | -------------------------------------------------------------------- |
+| 服务地址         | outlookEmail 站点根地址，如 `https://outlook-email.example.com`，不要追加 `/api` |
+| API Key          | outlookEmail「对外 API Key」，用于调用 `/api/external/accounts` 和 `/api/external/emails` |
+| 管理员密码       | 可选；当前收码流程只需要 API Key，该字段不会写入注册账号凭证         |
+| 固定邮箱         | 可选；填写后始终使用该邮箱，留空则从账号列表选择第一个可用邮箱       |
+| 分组 / 标签参数  | 可选；对应账号列表接口的 `group_id`、`tag_ids`、`include_untagged`   |
+| 邮件查询参数     | 可选；对应邮件列表接口的 `folder`、`top`、`subject_contains`、`from_contains`、`keyword` |
+| 跳过标签名称     | 可选；逗号或换行分隔，如 `已注册`，选择邮箱时会跳过带这些标签的账号 |
+| 注册成功后打标签 | 可选；逗号或换行分隔，如 `已注册`，注册成功后给对应 outlookEmail 账号打标签 |
+| Plus 开通后打标签 | 可选；逗号或换行分隔，如 `chatgpt plus`，ChatGPT Plus 成功开通后给对应 outlookEmail 账号打标签 |
+
+工作流程：
+
+1. 注册任务需要邮箱时，若配置了固定邮箱则直接使用该邮箱。
+2. 未配置固定邮箱时，系统调用 `/api/external/accounts`，按配置的分组、标签、排序参数拉取账号列表，并选择第一个可用且不带跳过标签的邮箱。
+3. 发送验证码前会先调用 `/api/external/emails` 记录当前邮件 ID；等待验证码时继续轮询邮件列表，跳过旧 ID，只从新邮件的主题、预览和正文摘要里提取 6 位验证码。
+4. 如果配置了完成后打标签，注册成功会打「注册成功后打标签」；ChatGPT Plus 自动支付或 GoPay Plus 付款成功后会打「Plus 开通后打标签」。
+
+跳过标签只依赖 `/api/external/accounts` 返回的 `tags` 字段，使用 API Key 即可。完成后自动打标签属于 outlookEmail 管理端写操作，需要填写管理员密码；系统会临时登录管理端、获取 CSRF Token、必要时创建标签，再调用 `/api/accounts/tags` 给对应邮箱账号打标签。打标签失败只会记录 warning，不会把已成功的注册或付款反向判失败。
+
+安全边界：aBaiAutoplus 不读取也不保存 Outlook 原始密码、Refresh Token 或 Microsoft Graph 凭据；注册账号关联信息只记录邮箱地址、outlookEmail 账号 ID、分组和刷新状态等非密钥元数据。API Key 和可选管理员密码仅作为 provider 配置字段保存，不会写入注册账号凭证；请不要写入代码、README、测试 fixture 或提交记录。
 
 ### 其他公共邮箱
 
