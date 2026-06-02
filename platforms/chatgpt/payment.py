@@ -5232,6 +5232,11 @@ def _wait_and_type_dob_by_id(
                 if callable(log):
                     log(f"  · #{eid} 已键入 DOB ✓ ({after})")
                 return True
+        after = _lock_dob_input_value_by_id(page, eid, dob_value, log=log)
+        if _paypal_dob_value_matches(after, dob_value):
+            if callable(log):
+                log(f"  · #{eid} 已锁定 DOB ✓ ({after})")
+            return True
         if callable(log):
             log(f"  · #{eid} 键入 DOB 后值为 {after!r}，重试")
         try:
@@ -5296,6 +5301,72 @@ def _force_fill_dob_input_by_id(page, element_id: str, value: str, *, log=None) 
     except Exception as exc:
         if callable(log):
             log(f"  · #{eid} DOB JS 设值异常: {exc}")
+        return ""
+    if isinstance(result, str) and result.startswith("ok:"):
+        return result[3:]
+    return str(result or "")
+
+
+def _lock_dob_input_value_by_id(page, element_id: str, value: str, *, log=None) -> str:
+    """Last-resort DOB fill: keep PayPal's mask from rewriting YYYY into YY."""
+    eid = str(element_id or "").strip()
+    dob_value = str(value or "").strip()
+    if not eid or not dob_value:
+        return ""
+    script = """
+    (args) => {
+      const { id, value } = args;
+      const el = document.getElementById(id);
+      if (!el) return 'no_element';
+      const proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+      const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+      const nativeGet = desc && desc.get;
+      const nativeSet = desc && desc.set;
+      if (!nativeSet) return 'no_setter';
+      const expectedDigits = String(value || '').replace(/\\D/g, '');
+      const getValue = () => String(nativeGet ? nativeGet.call(el) : el.value || '');
+      const setNative = (next) => {
+        nativeSet.call(el, String(next || ''));
+        try { el.setAttribute('value', String(next || '')); } catch (e) {}
+      };
+      if (!el.__ctfDobValueLock) {
+        Object.defineProperty(el, 'value', {
+          configurable: true,
+          get() {
+            return getValue();
+          },
+          set(next) {
+            const text = String(next == null ? '' : next);
+            const digits = text.replace(/\\D/g, '');
+            if (expectedDigits && digits && digits.length < expectedDigits.length) {
+              setNative(value);
+              return;
+            }
+            setNative(text);
+          },
+        });
+        el.__ctfDobValueLock = true;
+      }
+      try { el.focus(); } catch (e) {}
+      try { if (el._valueTracker) el._valueTracker.setValue(''); } catch (e) {}
+      setNative(value);
+      try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+      setNative(value);
+      try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+      setNative(value);
+      for (const delay of [0, 50, 150, 400, 900]) {
+        setTimeout(() => {
+          try { setNative(value); } catch (e) {}
+        }, delay);
+      }
+      return 'ok:' + getValue();
+    }
+    """
+    try:
+        result = page.evaluate(script, {"id": eid, "value": dob_value})
+    except Exception as exc:
+        if callable(log):
+            log(f"  · #{eid} DOB value lock 异常: {exc}")
         return ""
     if isinstance(result, str) and result.startswith("ok:"):
         return result[3:]

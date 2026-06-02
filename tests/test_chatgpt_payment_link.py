@@ -8278,6 +8278,65 @@ def test_wait_and_type_dob_refocuses_before_each_keyboard_candidate():
     assert all(target == "dateOfBirth" for target, _value in state["inserted"])
 
 
+def test_wait_and_type_dob_locks_value_when_mask_keeps_two_digit_year():
+    state = {"value": "", "locked": [], "inserted": [], "typed": []}
+
+    class FakeKeyboard:
+        def press(self, key):
+            if key == "Delete":
+                state["value"] = ""
+
+        def insert_text(self, text):
+            state["inserted"].append(text)
+            state["value"] = "9/5/19"
+
+        def type(self, text, delay=0):
+            state["typed"].append(text)
+            state["value"] = "9/5/19"
+
+    class FakeLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def click(self):
+            pass
+
+    class FakePage:
+        keyboard = FakeKeyboard()
+
+        def evaluate(self, script, arg=None):
+            if isinstance(arg, dict) and arg.get("id") == "dateOfBirth":
+                if "__ctfDobValueLock" in script:
+                    value = str(arg.get("value") or "")
+                    state["locked"].append(value)
+                    state["value"] = value
+                    return f"ok:{value}"
+                state["value"] = "09/05/19"
+                return f"ok:{state['value']}"
+            if "document.getElementById" in script:
+                return state["value"]
+            return None
+
+        def locator(self, selector):
+            return FakeLocator()
+
+        def wait_for_timeout(self, timeout):
+            pass
+
+    assert payment_module._wait_and_type_dob_by_id(
+        FakePage(),
+        "dateOfBirth",
+        payment_module.CTF_DATE_OF_BIRTH,
+        attempts=1,
+        interval_ms=0,
+        log=lambda _m: None,
+    ) is True
+    assert state["locked"] == [payment_module.CTF_DATE_OF_BIRTH]
+    assert state["value"] == payment_module.CTF_DATE_OF_BIRTH
+
+
 def test_fill_ctf_payment_form_fills_both_kanji_and_kana_names_for_jp():
     """JP 区统一 guest 表单：漢字组(#firstName/#lastName) 和片假名组
     (#countrySpecificFirstName/#countrySpecificLastName) 都要分别填对。"""
