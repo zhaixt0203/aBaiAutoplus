@@ -359,6 +359,98 @@ def register_gopay_account(
         return session.get(AccountModel, model_id)
 
 
+def acquire_gopay_via_rebind(
+    *,
+    herosms_api_key: str = "",
+    pin: str = "147258",
+    proxy: str = "",
+    sms_provider: str = "herosms",
+    smspool_api_key: str = "",
+    smsbower_api_key: str = "",
+    smsapi_url: str = "",
+    smsapi_phone: str = "",
+    herosms_max_price_usd: str = "",
+    smspool_max_price: str = "",
+    log: Callable[[str], None] = print,
+) -> AccountModel | None:
+    """换绑获号：成熟老账号改绑到新拿的未注册号，入库后返回 AccountModel。
+
+    用户验证过的正确方向：风控判账号不判手机号。新注册号秒付会被 FDS 拒，
+    所以取一个成熟老账号（本地 ``gopay_worker_accounts.json`` 里 refresh_token
+    还活的）改绑到一个干净的新号，用新号 + 老账号身份进支付流程。
+
+    接码渠道用于「拿新号 + 接换绑 OTP + 后续付款 OTP」，新号必须能接码
+    （所以这里用注册同款渠道：herosms / smspool / smsbower；smsapi 固定号
+    没法当"新号"用，会在 plugin 里报错）。失败返回 None。
+    """
+    from core.base_platform import RegisterConfig
+    from core.registry import get as get_platform
+
+    provider = str(sms_provider or "herosms").strip().lower()
+    if provider == "smsapi":
+        log("换绑获号不支持 smsapi 固定号渠道（新号必须能独立接码），请改用 herosms/smspool/smsbower")
+        return None
+
+    effective_proxy = _normalize_proxy_url(proxy)
+    if not effective_proxy:
+        try:
+            from core.proxy_pool import proxy_pool
+
+            picked = proxy_pool.get_next(region="ID") or ""
+            if picked:
+                effective_proxy = _normalize_proxy_url(picked)
+                log(f"代理池分配：{_mask_proxy(effective_proxy)}（GoPay 换绑获号用）")
+            else:
+                log("代理池为空，GoPay 换绑获号回退直连")
+        except Exception as exc:
+            log(f"代理池调用异常，GoPay 换绑获号回退直连：{exc}")
+
+    cfg = RegisterConfig(
+        executor_type="protocol",
+        captcha_solver="auto",
+        proxy=effective_proxy or None,
+        extra={
+            "identity_provider": "phone",
+            "herosms_api_key": str(herosms_api_key or ""),
+            "gopay_pin": str(pin or "147258"),
+            "gopay_proxy": effective_proxy or "",
+            "sms_provider": provider,
+            "smspool_api_key": str(smspool_api_key or ""),
+            "smsbower_api_key": str(smsbower_api_key or ""),
+            "smsapi_url": str(smsapi_url or ""),
+            "smsapi_phone": str(smsapi_phone or ""),
+            "herosms_max_price_usd": str(herosms_max_price_usd or ""),
+            "smspool_max_price": str(smspool_max_price or ""),
+        },
+    )
+    try:
+        platform_cls = get_platform("gopay")
+        platform = platform_cls(config=cfg)
+        if hasattr(platform, "set_logger"):
+            platform.set_logger(log)
+        log("开始换绑获号：成熟老账号改绑到新号…")
+        account = platform.acquire_via_rebind()
+    except Exception as exc:
+        log(f"换绑获号失败: {exc}")
+        return None
+
+    save_account(account)
+    with Session(engine) as session:
+        fresh = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "gopay")
+            .where(AccountModel.email == account.email)
+        ).first()
+        if not fresh:
+            log("换绑获号入库后查不到记录，异常")
+            return None
+        model_id = int(fresh.id)
+    log(f"换绑获号成功并入库: #{model_id} {account.email}")
+
+    with Session(engine) as session:
+        return session.get(AccountModel, model_id)
+
+
 # ===========================================================================
 # 换绑（改绑新号 + 释放旧号）编排
 # ===========================================================================
@@ -371,13 +463,21 @@ def _build_rebind_otp_callback(
     service: str = "",
     log: Callable[[str], None] = print,
 ):
-    """买一个换绑用的临时外国号，返回 ``(new_phone, wait_otp, finish, cancel)``。
+    """买一个换绑用的新印尼号，返回 ``(new_phone, wait_otp, finish, cancel, meta)``。
 
     **换绑渠道独立于注册渠道**：注册可能用 smsapi（固定号，没法买一次性号），
-    换绑必须走能买一次性外国号的渠道（herosms / smsbower，SMS-Activate 风格）。
+    换绑必须走能买一次性号的渠道（herosms / smsbower，SMS-Activate 风格）。
+    换绑后的新号要继续用于下一轮 GoPay 付款，所以买的是**印尼号**（country=6，
+    见 sms_channel 默认）。
 
-    new_phone: 新号（+xx...）；wait_otp(phone, timeout)->code；finish() 用完归还；
-    cancel() 失败取消。买号失败返回 ``(None, ...)``。
+    返回：
+      new_phone: 新印尼号（+62...）
+      wait_otp(phone, timeout)->code: 接新号的换绑/付款 OTP
+      finish(): 用完归还（付款全部结束后才调）
+      cancel(): 失败取消
+      meta: ``{"provider","aid","sms_key"}``——付款阶段要用同渠道+同 aid 接
+            新号的 midtrans OTP，所以把这些透传出去。
+    买号失败返回 ``(None, None, None, None, None)``。
     """
     from platforms.gopay._opai_loader import ensure_opai_on_path
 
@@ -390,23 +490,23 @@ def _build_rebind_otp_callback(
         from platforms.gopay.sms_channel import make_smsbower_channel
         key = key or os.environ.get("OPAI_SMSBOWER_API_KEY", "").strip()
         if not key:
-            log("换绑失败：缺少 SMSBower API key（买换绑临时号用）")
-            return None, None, None, None
+            log("换绑失败：缺少 SMSBower API key（买换绑新号用）")
+            return None, None, None, None, None
         channel = make_smsbower_channel(api_key=key, country=country, service=service)
     else:
         # 默认 Hero-SMS
         from platforms.gopay.sms_channel import make_herosms_rebind_channel
         key = key or os.environ.get("OPAI_HEROSMS_API_KEY", "").strip()
         if not key:
-            log("换绑失败：缺少 Hero-SMS API key（买换绑临时号用）")
-            return None, None, None, None
+            log("换绑失败：缺少 Hero-SMS API key（买换绑新号用）")
+            return None, None, None, None, None
         channel = make_herosms_rebind_channel(api_key=key, country=country, service=service)
 
     new_phone, aid = channel.get_number()
     if not new_phone or not aid:
-        log(f"换绑失败：{provider} 没买到换绑临时号")
-        return None, None, None, None
-    log(f"换绑临时号已购（{provider}）：{new_phone}（aid={aid}）")
+        log(f"换绑失败：{provider} 没买到换绑新号")
+        return None, None, None, None, None
+    log(f"换绑新印尼号已购（{provider}）：{new_phone}（aid={aid}）")
 
     def _wait_otp(_phone_arg: str = "", timeout: int = 180) -> Optional[str]:
         try:
@@ -428,7 +528,8 @@ def _build_rebind_otp_callback(
         except Exception:
             pass
 
-    return new_phone, _wait_otp, _finish, _cancel
+    meta = {"provider": provider, "aid": str(aid), "sms_key": key}
+    return new_phone, _wait_otp, _finish, _cancel, meta
 
 
 def rebind_release_phone(
@@ -445,7 +546,7 @@ def rebind_release_phone(
 
     返回 ``{"success": bool, "detail": str, "new_phone": str}``。
     """
-    new_phone, wait_otp, finish, cancel = _build_rebind_otp_callback(
+    new_phone, wait_otp, finish, cancel, _meta = _build_rebind_otp_callback(
         rebind_provider=rebind_provider,
         rebind_sms_key=rebind_sms_key,
         country=rebind_country,
@@ -631,6 +732,7 @@ def step_generate_cashier_url(
     country: str = "ID",
     currency: str = "IDR",
     proxy: Optional[str] = None,
+    use_stripe_init: bool = False,
     log: Callable[[str], None] = print,
 ) -> str:
     """步骤 ①：协议拿 ChatGPT Plus cashier URL。"""
@@ -657,6 +759,8 @@ def step_generate_cashier_url(
         )
 
     log(f"协议生成 cashier_url（country={country}, currency={currency}，不使用代理）")
+    if use_stripe_init:
+        log("cashier_url 走 Stripe init 协议长链（accessToken → pay.openai.com，纯协议）")
     # 生成支付链接强制直连：ChatGPT cashier API 不需要代理，走代理反而可能
     # 因为出口 IP 与账号注册地不一致触发风控。忽略传入的 proxy。
     #
@@ -673,6 +777,7 @@ def step_generate_cashier_url(
                 proxy=None,
                 country=country,
                 currency=currency,
+                use_stripe_init=use_stripe_init,
             )
             break
         except Exception as exc:  # noqa: BLE001 - 需按错误内容判断是否重试
@@ -805,6 +910,17 @@ def step_pay_with_gopay(
         or str(sms_provider_override or "").strip().lower()
         or "herosms"
     )
+    # 换绑获号场景：账号是登录旧号后换绑到的新印尼号，付款 OTP 要从**换绑渠道
+    # 的新号**接。worker 把换绑渠道独立 key 存进了 extra.rebind_sms_key，这里
+    # 取出来覆盖对应渠道的 key（herosms/smsbower）。普通注册号该字段为空，
+    # 走原有 *_override / 环境变量逻辑。
+    rebind_sms_key = str(extra.get("rebind_sms_key") or "").strip()
+    if rebind_sms_key:
+        if provider == "smsbower":
+            smsbower_api_key_override = smsbower_api_key_override or rebind_sms_key
+        else:
+            herosms_api_key_override = herosms_api_key_override or rebind_sms_key
+        log(f"换绑获号号付款：用换绑渠道独立 key 接新号 OTP（provider={provider}）")
 
     if not (phone_local and pin and aid):
         raise RuntimeError(
@@ -1037,6 +1153,7 @@ def execute_gopay_pay_chatgpt(
     rebind_service: str = "",
     capture_payment: bool = False,
     capture_dir: str = "",
+    use_stripe_init: bool = False,
     log: Callable[[str], None] = print,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
@@ -1250,6 +1367,7 @@ def execute_gopay_pay_chatgpt(
                 country=country,
                 currency=currency,
                 proxy=proxy,
+                use_stripe_init=use_stripe_init,
                 log=log,
             )
         cashier_url = out["cashier_url"]
@@ -1314,7 +1432,11 @@ def execute_gopay_pay_chatgpt(
     )
 
     # #2：付款成功后自动换绑，把当前 GoPay 号占用的（印尼）号释放出来。
-    if auto_rebind and isinstance(out.get("payment"), dict) and out["payment"].get("success"):
+    if (
+        auto_rebind
+        and isinstance(out.get("payment"), dict)
+        and out["payment"].get("success")
+    ):
         try:
             g_extra = _account_extra(gopay)
             g_phone = str(g_extra.get("phone") or gopay.email or "").strip()

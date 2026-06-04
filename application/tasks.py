@@ -924,6 +924,9 @@ def _auto_followup_chatgpt_plus_payment(
         params["proxy_region"] = str(payment_cfg.get("proxy_region") or "").strip().upper()
     if payment_cfg.get("checkout_mode") not in (None, ""):
         params["checkout_mode"] = str(payment_cfg.get("checkout_mode") or "").strip().lower()
+    # Stripe 协议长链开关（accessToken → pay.openai.com，纯协议生成 cashier_url）
+    if payment_cfg.get("use_stripe_init") not in (None, ""):
+        params["use_stripe_init"] = str(payment_cfg.get("use_stripe_init")).strip().lower()
     # bitbrowser_* 模式下需要 BitBrowser 客户端里手工建好的 profile ID
     # （见 platforms/_browser_backend.py BrowserBackendConfig.bitbrowser）。
     # 留空时插件层会回退到 BIT_PROFILE_ID 环境变量。
@@ -1696,6 +1699,13 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
         or str(_capture_raw or "").strip().lower() in ("1", "true", "yes", "on")
     )
     capture_dir = str(payload.get("capture_dir") or "")
+    # 用 Stripe payment_pages/init 协议生成 cashier_url（accessToken →
+    # pay.openai.com 长链，纯协议）。
+    _stripe_init_raw = payload.get("use_stripe_init")
+    use_stripe_init = (
+        _stripe_init_raw is True
+        or str(_stripe_init_raw or "").strip().lower() in ("1", "true", "yes", "on")
+    )
 
     total = len(chatgpt_ids)
     concurrency = min(max(int(payload.get("concurrency") or 1), 1), total)
@@ -1767,6 +1777,7 @@ def _execute_gopay_pay_chatgpt_task(payload: dict[str, Any], logger: TaskLogger)
                 rebind_service=rebind_service,
                 capture_payment=capture_payment,
                 capture_dir=capture_dir,
+                use_stripe_init=use_stripe_init,
                 log=logger.log,
                 cancel_check=logger.is_cancel_requested,
             )

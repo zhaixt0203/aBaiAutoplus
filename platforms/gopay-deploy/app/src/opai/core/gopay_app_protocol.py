@@ -33,6 +33,10 @@ APP_VERSION = "2.10.0"
 APP_BUILD = "2100"
 AUTH_ID = "gopay:consumer:app"
 AUTH_SECRET = "raOUumeMRBNifqvZRFjvsgTnjAlaA9"
+# known-PIN 登录（goto_pin / login_1fa）用的 PIN 客户端标识，来自
+# 20260602/gopay_rebind_smscode.py::login_with_known_pin。这个 client_id 跟
+# 付款链路里的 MGUPA / GWC 不是一回事——它专门用于 login_1fa 的 PIN 验证。
+MFAGOJEK_CLIENT_ID = "6d11d261d7ae462dbd4be0dc5f36a697-MFAGOJEK"
 SIGNUP_CLIENT_NAME = "gopay_consumer_app"
 # Signup body still uses the LoginSDK client secret in the closest live/OSINT
 # implementation; the endpoint-level Authorization is a separate static Basic
@@ -919,6 +923,126 @@ class GoPayProtocol:
         body = {"otp": otp, "otp_token": otp_token}
         return self.post(API, "/v5/customers/verificationUpdateProfile", body, auth=access_token)
 
+    # ------------------------------------------------------------------
+    # 已关联第三方应用（Linked apps）的查询与解绑 —— 来自 20260603/unlink 抓包
+    # ------------------------------------------------------------------
+    def linked_apps(self, access_token: str) -> Tuple[int, Any, Dict[str, str]]:
+        """GET customer.gopayapi.com/v1/linkedapps —— 列出已关联的第三方服务。
+
+        响应形如::
+
+            {"data": {"linked_services": [
+                {"service_id": "CHECKOUT_MIDTRANS",
+                 "service_name": "OpenAI LLC",
+                 "unlink_service_url": "/v1/links/<link_id>",
+                 "allow_service_unlink": true,
+                 "linked_accounts": [
+                     {"link_id": "<link_id>", "is_active": true,
+                      "unlink_url": "/v1/links?link_id=<link_id>",
+                      "allow_account_unlink": true}]}]},
+             "success": true}
+        """
+        return self.get(CUSTOMER, "/v1/linkedapps", auth=access_token)
+
+    def unlink_link(self, access_token: str, link_id_or_url: str) -> Tuple[int, Any, Dict[str, str]]:
+        """PATCH customer.gopayapi.com/v1/links/<link_id> —— 解绑一个关联。
+
+        抓包里 App 走的是 ``unlink_service_url``（``/v1/links/<link_id>``）的
+        **PATCH**、空 body（content-length: 0），返回 ``202 {"success": true}``。
+        入参可以直接传 link_id，也可以传完整的 ``/v1/links/<link_id>`` 路径。
+        """
+        value = str(link_id_or_url or "").strip()
+        if not value:
+            raise ValueError("empty link id/url")
+        if value.startswith("http://") or value.startswith("https://"):
+            value = urlparse(value).path
+        if value.startswith("/v1/links"):
+            path = value
+        else:
+            path = f"/v1/links/{value}"
+        # 空 body：body=None -> body_text="" -> content-length 0，与抓包一致。
+        return self._send("PATCH", CUSTOMER, path, None, auth=access_token)
+
+    # ------------------------------------------------------------------
+    # known-PIN 登录（goto_pin / login_1fa）—— 来自 20260602/gopay_rebind_smscode
+    # ------------------------------------------------------------------
+    def pin_tokens_nb(self, challenge_id: str, pin: str, client_id: str = MFAGOJEK_CLIENT_ID) -> Tuple[int, Any, Dict[str, str]]:
+        """POST customer.gopayapi.com/api/v1/users/pin/tokens/nb —— 用 PIN 换 validation_jwt。
+
+        login_1fa 的 goto_pin 验证：把明文 PIN + challenge_id 提交给
+        CUSTOMER，拿回 ``data.token``（RS256 validation_jwt），再交给
+        cvs/v1/verify 完成挑战。``client_id`` 用 MFAGOJEK（登录态），与付款
+        链路的 MGUPA/GWC 区分。
+        """
+        body = {"challenge_id": challenge_id, "client_id": client_id, "pin": pin}
+        return self.post(CUSTOMER, "/api/v1/users/pin/tokens/nb", body)
+
+    def cvs_verify_pin_validation(self, verification_id: str, challenge_id: str, validation_jwt: str,
+                                  flow: str = "login_1fa", method: str = "goto_pin") -> Tuple[int, Any, Dict[str, str]]:
+        """POST accounts.goto-products.com/cvs/v1/verify —— 用 validation_jwt 完成 goto_pin 挑战。
+
+        与 OTP 版 ``cvs_verify`` 不同：data 里放的是
+        ``{challenge_id, validation_jwt}`` 而不是 ``{otp, otp_token}``。
+        """
+        body = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "data": {"challenge_id": challenge_id, "validation_jwt": validation_jwt},
+            "flow": flow,
+            "verification_id": verification_id,
+            "verification_method": method,
+        }
+        return self.post(AUTH, "/cvs/v1/verify", body)
+
+    def cvs_initiate_login(self, phone_local: str, verification_id: str, method: str = "goto_pin",
+                           flow: str = "login_1fa", country_code: str = "+62",
+                           is_multiple_method: Optional[bool] = True) -> Tuple[int, Any, Dict[str, str]]:
+        """POST cvs/v1/initiate —— 登录专用（真机抓包对齐）。
+
+        与注册用的 ``cvs_initiate`` 区别：登录 1fa(goto_pin) 真机带
+        ``is_multiple_method: true``；2fa(otp_sms) 带 null。响应里返回的是
+        **challenge_id**（不是新的 verification_id），交给 pin/tokens/nb。
+        """
+        body = {
+            "verification_id": verification_id,
+            "flow": flow,
+            "verification_method": method,
+            "country_code": country_code,
+            "email_address": None,
+            "client_id": self.client_id,
+            "phone_number": phone_local,
+            "client_secret": self.client_secret,
+            "is_multiple_method": is_multiple_method,
+            "device_verification_token_id": None,
+        }
+        return self.post(AUTH, "/cvs/v1//initiate", body, extra_headers={"key": "value"}, sign_path="/cvs/v1/initiate")
+
+    def pin_page_nb(self, access_token: Optional[str], challenge_id: str) -> Tuple[int, Any, Dict[str, str]]:
+        """GET customer.gopayapi.com/api/v2/challenges/{challenge_id}/pin-page/nb。
+
+        真机登录在 pin/tokens/nb 之前会先 GET 这个 pin-page（预热/取
+        challenge 元数据）。登录态此时还没有 access_token，可传 None。
+        """
+        return self.get(CUSTOMER, f"/api/v2/challenges/{challenge_id}/pin-page/nb", auth=access_token)
+
+    def token_2fa(self, challenge_token: str, verification_token: str, account_id: str = "") -> Tuple[int, Any, Dict[str, str]]:
+        """POST goto-auth/token —— 登录 2FA 最终兑换（真机抓包对齐）。
+
+        body: ``{grant_type:"challenge", token:<2fa_token>, account_id?, ...}``
+        header: ``verification-token: Bearer <login_2fa cvs/verify 拿到的 token>``
+        返回最终 access_token / refresh_token。
+        """
+        body: Dict[str, Any] = {
+            "grant_type": "challenge",
+            "account_id": account_id,
+            "token": challenge_token,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "ext_user_token": None,
+        }
+        extra = {"verification-token": f"Bearer {verification_token}"}
+        return self.post(AUTH, "/goto-auth/token", body, extra_headers=extra)
+
 
 # ===========================================================================
 # 主项目集成层（aBaiAutoplus）
@@ -1049,6 +1173,187 @@ class _AuthState:
         self.refresh_token = refresh_token
 
 
+def login_with_known_pin(gp: "GoPayProtocol", phone: str, pin: str, log=None,
+                          wait_2fa_otp=None) -> Tuple[str, str]:
+    """用**已知 PIN**登录一个已注册账号（真机抓包对齐，两段式 1fa+2fa）。
+
+    真机 GoPay 2.8.0 登录实测流程（gopay-auto-protocol/20260603/login）：
+
+      1. login/methods                         → verification_id(1fa) + methods
+      2. cvs/v1/initiate(login_1fa, goto_pin,   → challenge_id
+         is_multiple_method=true)
+      3. (可选) GET challenges/{cid}/pin-page/nb 预热
+      4. pin/tokens/nb {challenge_id, MFAGOJEK, pin} → validation_jwt
+      5. cvs/v1/verify(login_1fa, goto_pin,     → verification_token(1fa)
+         data={challenge_id, validation_jwt})
+      6. accountlist(verification-token=1fa)    → account_id + 1fa_token
+      7. token(grant=cvs, account_id, 1fa_token) → **403 need_2fa** + 2fa_token
+                                                   + 新 verification_id(2fa)
+      8. cvs/v1/initiate(login_2fa, otp_sms)    → otp_token，发短信到该号
+      9. wait_2fa_otp(phone) 接短信 OTP
+     10. cvs/v1/verify(login_2fa, otp, otp_token) → verification_token(2fa)
+     11. token_2fa(grant=challenge, 2fa_token,  → **access_token / refresh_token**
+         header verification-token=2fa verify token)
+
+    关键差异（修复之前 known-PIN 登录必 401 的根因）：
+      - verification_id 来自 **login/methods**，不是 cvs/v1/methods（登录不调 methods）
+      - 1fa 之后服务端**强制 2FA OTP**，必须再接一条短信才能拿 access_token
+
+    ``wait_2fa_otp(phone, timeout) -> code|None``：登录 2FA 的短信回调。
+    **该号必须能接这条 2FA 短信**（成熟号换绑场景=正在租的新号）。不传则
+    走完 1fa 在 403 处返回 ``("", "")``（拿不到最终 token）。
+
+    返回 ``(access_token, refresh_token)``；失败 ``("", "")``。
+    """
+    _log = log or (lambda *_a, **_k: None)
+    country_code, local = normalize_id_phone(phone)
+
+    # === 1. login/methods → verification_id(1fa) ===
+    gp.new_cvs_session()
+    sc, data, _ = gp.login_methods(local, country_code)
+    if sc not in (200, 201, 202):
+        _log(f"[known-pin] login_methods HTTP {sc}")
+        return "", ""
+    methods = pick_first(data, ["allowed_methods", "methods"]) or []
+    verification_id = str(pick_first(data, ["verification_id"]) or "")
+    if isinstance(methods, list) and methods and "goto_pin" not in methods:
+        _log(f"[known-pin] 该号不支持 goto_pin 登录（methods={methods}）")
+        # 仍尝试，服务端会拒
+    # login/methods 不一定回 verification_id；没有就回退 cvs/v1/methods 拿
+    if not verification_id:
+        sc, data, _ = gp.cvs_methods(local, flow="login_1fa", country_code=country_code)
+        if sc in (200, 201, 202):
+            verification_id = str(pick_first(data, ["verification_id"]) or "")
+    if not verification_id:
+        _log("[known-pin] no verification_id from login/methods")
+        return "", ""
+
+    # === 2. cvs/v1/initiate(login_1fa, goto_pin, is_multiple_method=true) → challenge_id ===
+    sc, data, _ = gp.cvs_initiate_login(
+        local, verification_id, method="goto_pin", flow="login_1fa",
+        country_code=country_code, is_multiple_method=True,
+    )
+    if sc not in (200, 201, 202, 204):
+        _log(f"[known-pin] cvs_initiate(login_1fa/goto_pin) HTTP {sc}: {str(data)[:300]}")
+        return "", ""
+    challenge_id = str(pick_first(data, ["challenge_id", "challengeId"]) or "")
+    if not challenge_id:
+        _log(f"[known-pin] cvs_initiate 未返回 challenge_id: {str(data)[:200]}")
+        return "", ""
+
+    # === 3. (可选) pin-page 预热 ===
+    try:
+        gp.pin_page_nb(None, challenge_id)
+    except Exception:
+        pass
+
+    # === 4. pin/tokens/nb → validation_jwt ===
+    sc, data, _ = gp.pin_tokens_nb(challenge_id, pin, client_id=MFAGOJEK_CLIENT_ID)
+    if sc not in (200, 201, 202):
+        _log(f"[known-pin] pin/tokens/nb HTTP {sc}: {str(data)[:300]}")
+        return "", ""
+    validation_jwt = str(pick_first(data, ["token"]) or "")
+    if not validation_jwt:
+        _log("[known-pin] no validation_jwt")
+        return "", ""
+
+    # === 5. cvs/v1/verify(login_1fa, goto_pin, validation_jwt) → verification_token(1fa) ===
+    sc, data, _ = gp.cvs_verify_pin_validation(
+        verification_id, challenge_id, validation_jwt, flow="login_1fa", method="goto_pin",
+    )
+    if sc not in (200, 201, 202):
+        _log(f"[known-pin] cvs/v1/verify(login_1fa) HTTP {sc}: {str(data)[:300]}")
+        return "", ""
+    vtoken_1fa = str(pick_first(data, ["verification_token", "verificationToken"]) or "")
+    if not vtoken_1fa:
+        _log("[known-pin] login_1fa 无 verification_token")
+        return "", ""
+
+    # === 6. accountlist → account_id + 1fa_token ===
+    sc, data, _ = gp.accountlist(vtoken_1fa)
+    if sc not in (200, 201, 202):
+        _log(f"[known-pin] accountlist HTTP {sc}")
+        return "", ""
+    account_id = extract_account_id(data) or ""
+    one_fa_token = str(pick_first(data, ["1fa_token", "one_fa_token", "token"]) or vtoken_1fa)
+
+    # === 7. token(grant=cvs, account_id, 1fa_token) → 期望 403 need_2fa + 2fa_token ===
+    sc, data, _ = gp.token(verification_token=one_fa_token, account_id=account_id)
+    access_token = str(pick_first(data, ["access_token", "accessToken"]) or "")
+    refresh_token = str(pick_first(data, ["refresh_token", "refreshToken"]) or "")
+    if access_token:
+        # 个别号/受信设备 1fa 直接给 token（无 2fa）
+        gp.clear_cvs_session()
+        _log("[known-pin] 1fa 直接拿到 access_token（无需 2fa）")
+        return access_token, refresh_token
+
+    twofa_token = str(pick_first(data, ["2fa_token", "two_fa_token"]) or "")
+    vid_2fa = str(pick_first(data, ["verification_id"]) or "")
+    if not twofa_token or not vid_2fa:
+        _log(f"[known-pin] 1fa 后既无 access_token 也无 2fa_token，放弃: HTTP {sc} {str(data)[:300]}")
+        return "", ""
+
+    if not callable(wait_2fa_otp):
+        _log("[known-pin] 需要 2FA OTP 但没有提供 wait_2fa_otp 回调，放弃")
+        return "", ""
+
+    # === 8. cvs/v1/initiate(login_2fa, otp_sms) → otp_token，发短信 ===
+    # 关键：2fa 必须延续 1fa 的同一个 transaction-id（真机抓包确认整条登录
+    # login/methods→1fa→token→2fa→token 全程同一 txn）。**不要** new_cvs_session，
+    # 否则服务端判 invalid_parameter（换了会话 id）。
+    sc, data, _ = gp.cvs_initiate_login(
+        local, vid_2fa, method="otp_sms", flow="login_2fa",
+        country_code=country_code, is_multiple_method=None,
+    )
+    if sc not in (200, 201, 202, 204):
+        _log(f"[known-pin] cvs_initiate(login_2fa) HTTP {sc}: {str(data)[:300]}")
+        return "", ""
+    otp_token = str(pick_first(data, ["otp_token", "otpToken"]) or "")
+
+    # === 9. 接 2FA 短信 OTP ===
+    try:
+        otp = wait_2fa_otp(phone, 180)
+    except Exception as exc:
+        _log(f"[known-pin] wait_2fa_otp 异常: {exc}")
+        return "", ""
+    if not otp:
+        _log("[known-pin] 2FA OTP 超时/未拿到")
+        return "", ""
+
+    # === 10. cvs/v1/verify(login_2fa, otp) → verification_token(2fa) ===
+    sc, data, _ = gp.cvs_verify(
+        local, vid_2fa, str(otp), method="otp_sms", flow="login_2fa",
+        country_code=country_code, otp_token=otp_token or None,
+    )
+    if sc not in (200, 201, 202):
+        _log(f"[known-pin] cvs/v1/verify(login_2fa) HTTP {sc}: {str(data)[:300]}")
+        return "", ""
+    vtoken_2fa = str(pick_first(data, ["verification_token", "verificationToken"]) or "")
+    if not vtoken_2fa:
+        _log("[known-pin] login_2fa 无 verification_token")
+        return "", ""
+
+    # === 11. token_2fa(grant=challenge, 2fa_token, header verification-token=2fa) ===
+    # 仍用同一 txn（真机最终 token 也在同会话内）。
+    sc, data, _ = gp.token_2fa(twofa_token, vtoken_2fa, account_id=account_id)
+    gp.clear_cvs_session()
+    if sc not in (200, 201, 202):
+        _log(f"[known-pin] token_2fa HTTP {sc}: {str(data)[:300]}")
+        return "", ""
+    return (
+        str(pick_first(data, ["access_token", "accessToken"]) or ""),
+        str(pick_first(data, ["refresh_token", "refreshToken"]) or ""),
+    )
+
+
+class _AuthState:
+    """与旧 GojekClient.auth 兼容的可变 token 容器。"""
+
+    def __init__(self, access_token: str = "", refresh_token: str = ""):
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+
+
 class GoPayAppClient:
     """GoPay App 纯协议客户端的下游兼容包装。
 
@@ -1132,10 +1437,13 @@ class GoPayAppClient:
 
     # --- 换绑手机号（改绑新号 + 释放旧号）---------------------------------
     def rebind_phone(self, *, new_phone: str, pin: str, wait_otp, email: str = "",
-                     signed_up_country: str = "ID", otp_timeout: int = 180, log=None) -> dict:
+                     signed_up_country: str = "ID", otp_timeout: int = 180,
+                     unlink_openai_first: bool = True,
+                     unlink_keyword: str = "OpenAI", log=None) -> dict:
         """把当前登录账号从旧号换绑到 ``new_phone`` 并释放旧号。
 
-        步骤：
+        步骤（对应用户给的换绑链路 4→5→6）：
+          0. （unlink_openai_first）进入 Linked apps，解绑 OpenAI LLC
           1. PATCH /v5/customers (pin header) -> otp_token
           2. wait_otp(new_phone, timeout) 从新号接 OTP
           3. POST /v5/customers/verificationUpdateProfile -> 完成
@@ -1145,11 +1453,27 @@ class GoPayAppClient:
             pin: 当前账号 6 位 PIN
             wait_otp: 拿新号 OTP 的回调 (phone, timeout) -> code|None
             email: 换绑同时可改邮箱（可空）
+            unlink_openai_first: 换绑前先解绑 OpenAI LLC（默认开）
+            unlink_keyword: 要解绑的已关联应用名关键字（默认 OpenAI）
 
         Returns: {"success": bool, "detail": str, "new_phone": str}
         """
         _log = log or (lambda *_a, **_k: None)
         at = self.auth.access_token
+
+        # 步骤 4+5：进入 Linked apps -> 解绑 OpenAI LLC（换绑前先解绑，避免新号
+        # 继承旧号对商户的关联）。解绑失败只告警不阻断换绑。
+        if unlink_openai_first:
+            try:
+                ures = self.unlink_linked_app(service_name_keyword=unlink_keyword, log=log)
+                if ures.get("success"):
+                    if ures.get("unlinked"):
+                        _log(f"[rebind] 换绑前已解绑：{ures['unlinked']}")
+                else:
+                    _log(f"[rebind] 换绑前解绑未成功（继续换绑）：{ures.get('detail')}")
+            except Exception as exc:
+                _log(f"[rebind] 换绑前解绑异常（继续换绑）：{exc}")
+
         sc, data, _ = self.proto.customers_update_phone(
             at, new_phone, pin, email=email, signed_up_country=signed_up_country,
         )
@@ -1173,3 +1497,77 @@ class GoPayAppClient:
             return {"success": False, "detail": f"verify_update 失败 HTTP {sc}: {data}", "new_phone": new_phone}
         _log(f"[rebind] 换绑成功，旧号已释放，新号 {new_phone}")
         return {"success": True, "detail": "rebind ok", "new_phone": new_phone}
+
+    # --- 解绑已关联第三方应用（Linked apps，如 OpenAI LLC）-----------------
+    def list_linked_apps(self, log=None) -> list:
+        """读取当前账号的 Linked apps 列表，返回 ``linked_services`` 数组。
+
+        失败/为空时返回 ``[]``。
+        """
+        _log = log or (lambda *_a, **_k: None)
+        sc, data, _ = self.proto.linked_apps(self.auth.access_token)
+        if not is_success_response(sc, data):
+            _log(f"[unlink] 读取 Linked apps 失败 HTTP {sc}: {data}")
+            return []
+        services = []
+        if isinstance(data, dict):
+            inner = data.get("data")
+            if isinstance(inner, dict):
+                raw = inner.get("linked_services")
+                if isinstance(raw, list):
+                    services = raw
+        return services
+
+    def unlink_linked_app(self, *, service_name_keyword: str = "OpenAI", log=None) -> dict:
+        """解绑名称匹配 ``service_name_keyword`` 的已关联应用（默认 OpenAI LLC）。
+
+        对应 GoPay App「Linked apps → 解绑 OpenAI LLC」：
+          1. GET /v1/linkedapps 找到目标 service 的 unlink_service_url / link_id
+          2. PATCH /v1/links/<link_id> 空 body 解绑 -> 202 {"success": true}
+
+        返回 ``{"success": bool, "detail": str, "unlinked": [服务名...]}``。
+        没找到目标服务时 success=True、unlinked=[]（视为无需解绑）。
+        """
+        _log = log or (lambda *_a, **_k: None)
+        keyword = str(service_name_keyword or "").strip().lower()
+        services = self.list_linked_apps(log=log)
+        if not services:
+            _log("[unlink] Linked apps 为空，无需解绑")
+            return {"success": True, "detail": "no linked services", "unlinked": []}
+
+        targets = []
+        for svc in services:
+            if not isinstance(svc, dict):
+                continue
+            name = str(svc.get("service_name") or "")
+            if keyword and keyword not in name.lower():
+                continue
+            # 优先用 service 顶层的 unlink_service_url（抓包里 App 走的就是它），
+            # 回退到 linked_accounts[].link_id。
+            url = str(svc.get("unlink_service_url") or "").strip()
+            link_id = ""
+            for acc in (svc.get("linked_accounts") or []):
+                if isinstance(acc, dict) and acc.get("link_id"):
+                    link_id = str(acc.get("link_id"))
+                    break
+            targets.append((name, url, link_id))
+
+        if not targets:
+            _log(f"[unlink] 未找到匹配 '{service_name_keyword}' 的已关联应用，跳过")
+            return {"success": True, "detail": "target not linked", "unlinked": []}
+
+        unlinked = []
+        for name, url, link_id in targets:
+            ref = url or link_id
+            if not ref:
+                _log(f"[unlink] {name} 缺少 unlink_service_url/link_id，跳过")
+                continue
+            sc, data, _ = self.proto.unlink_link(self.auth.access_token, ref)
+            if is_success_response(sc, data):
+                _log(f"[unlink] 已解绑 {name}（{ref}）-> HTTP {sc}")
+                unlinked.append(name)
+            else:
+                _log(f"[unlink] 解绑 {name} 失败 HTTP {sc}: {data}")
+                return {"success": False, "detail": f"unlink {name} 失败 HTTP {sc}: {data}", "unlinked": unlinked}
+
+        return {"success": True, "detail": "unlink ok", "unlinked": unlinked}

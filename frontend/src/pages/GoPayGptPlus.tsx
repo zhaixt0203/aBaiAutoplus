@@ -121,7 +121,9 @@ export default function GoPayGptPlus() {
   // 调试抓包开关：开启后抓到 midtrans_url 不关浏览器，停在付款页让人工手动
   // 走完 GoPay 网页付款，全程录 HAR + dump 每页 HTML，不跑协议付款。
   const [capturePayment, setCapturePayment] = useState(false);
-  // 付款成功后自动换绑：买临时外国号绑上去，释放当前 GoPay 印尼号
+  // Stripe 协议长链：用 accessToken 直接生成 pay.openai.com cashier_url（纯协议）
+  const [useStripeInit, setUseStripeInit] = useState(false);
+  // 付款成功后自动换绑：买一个新印尼号把账号换绑过去，老号弃用，之后一直用新号付款
   const [autoRebind, setAutoRebind] = useState(false);
   // 换绑专用接码渠道（独立于注册渠道）：herosms / smsbower
   const [rebindProvider, setRebindProvider] = useState("herosms");
@@ -223,6 +225,7 @@ export default function GoPayGptPlus() {
         smsapi_phone: smsapiPhone.trim(),
         max_price: maxPrice.trim(),
         capture_payment: capturePayment,
+        use_stripe_init: useStripeInit,
         auto_rebind: autoRebind,
         rebind_provider: rebindProvider,
         rebind_sms_key: rebindSmsKey.trim(),
@@ -364,6 +367,26 @@ export default function GoPayGptPlus() {
             <label className="flex items-center gap-2 cursor-pointer select-none">
               <input
                 type="checkbox"
+                checked={useStripeInit}
+                onChange={(e) => setUseStripeInit(e.target.checked)}
+                className="h-4 w-4"
+              />
+              <span className="text-[var(--text)]">
+                Stripe 协议长链（用 accessToken 直接生成 cashier_url，纯协议、不靠浏览器拿链）
+              </span>
+            </label>
+            {useStripeInit && (
+              <p className="mt-1 text-[11px] text-[var(--text-muted)] leading-tight">
+                开启后步骤①不再依赖默认接口返回的 url，而是显式调 Stripe
+                <code>payment_pages/init</code> 把 checkout 实体化成完整
+                <code>pay.openai.com</code> 长链。后续仍需浏览器把长链跳到 Midtrans 抓 midtrans_url。
+              </p>
+            )}
+          </div>
+          <div className="md:col-span-4">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
                 checked={capturePayment}
                 onChange={(e) => setCapturePayment(e.target.checked)}
                 className="h-4 w-4"
@@ -390,7 +413,7 @@ export default function GoPayGptPlus() {
                 className="h-4 w-4"
               />
               <span className="text-[var(--text)]">
-                付款成功后自动换绑释放号（买临时外国号绑上去，把当前印尼号还回接码平台）
+                付款成功后自动换绑（买一个新印尼号，把账号换绑过去；老号弃用，之后一直用新印尼号付款）
               </span>
             </label>
             {autoRebind && (
@@ -417,12 +440,12 @@ export default function GoPayGptPlus() {
                   />
                 </div>
                 <div>
-                  <label className="block mb-1 text-[var(--text-muted)]">换绑国家（留空=泰国52）</label>
+                  <label className="block mb-1 text-[var(--text-muted)]">换绑国家（固定印尼=6）</label>
                   <input
                     type="text"
                     value={rebindCountry}
                     onChange={(e) => setRebindCountry(e.target.value)}
-                    placeholder="52"
+                    placeholder="6"
                     className="control-surface control-surface-compact w-full text-center"
                   />
                 </div>
@@ -437,8 +460,9 @@ export default function GoPayGptPlus() {
                   />
                 </div>
                 <div className="md:col-span-4 text-[11px] text-[var(--text-muted)] leading-tight">
-                  换绑渠道独立于注册渠道：注册用 smsapi（固定号）时换绑仍会从这里买一次性外国号。
-                  注册成功后会自动登录账号 → 换绑到临时号 → 释放原印尼号（#1/#2 同此开关）。
+                  换绑渠道独立于注册渠道：注册用 smsapi（固定号）时换绑仍会从这里买一次性号。
+                  换绑国家固定印尼（+62 / country=6），因为换绑后的新号要继续用于下一轮 GoPay 付款，外国号付不了。
+                  流程：付款成功 → 解绑 OpenAI LLC → 把账号换绑到新印尼号 → 老号弃用，之后一直用新号付款。
                 </div>
               </div>
             )}

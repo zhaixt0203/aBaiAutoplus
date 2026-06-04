@@ -52,6 +52,9 @@ const DEFAULT_PAYMENT = {
   // 烧配额；干净 BitBrowser profile 下"代码点击 + 10s 等"通常更稳。需要时
   // 用户在弹窗里手动开启。
   use_captcha_service: "false",
+  // Stripe 协议长链：用 accessToken 直接生成 pay.openai.com cashier_url（纯协议）。
+  // 默认 "false" 沿用原行为。
+  use_stripe_init: "false",
   // SMS 号码池（多行 `+phone----relay_url`），PayPal OTP 用。空串=不启用。
   sms_pool: "",
 };
@@ -409,6 +412,7 @@ function GeneratePlusModal({
           ),
           record_har: payment.record_har,
           use_captcha_service: payment.use_captcha_service,
+          use_stripe_init: payment.use_stripe_init,
           proxy_region: payment.country,
           address_region: payment.address_region || "US",
           sms_pool: payment.sms_pool,
@@ -484,6 +488,7 @@ function GeneratePlusModal({
           // 是否启用 YesCaptcha 求解。"false" 时后端的 turnstile_solver 会
           // 强制传 None，captcha 路径退化为"代码鼠标点击 + 10s 等转跳"。
           use_captcha_service: payment.use_captcha_service,
+          use_stripe_init: payment.use_stripe_init,
           proxy_region: payment.country,
           // 账单地址来源：US 走 meiguodizhi 主接口，JP 走 /jp-address。
           // 让 IP 在日本时也能拿到日文地址 + 日本邮编避免 PayPal 风控。
@@ -858,6 +863,22 @@ function GeneratePlusModal({
                         )
                       }
                       className="control-surface control-surface-compact"
+                    >
+                      <option value="false">{t("common.no")}</option>
+                      <option value="true">{t("common.yes")}</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs text-[var(--text-muted)]">
+                      Stripe 协议长链
+                    </label>
+                    <select
+                      value={String(payment.use_stripe_init)}
+                      onChange={(event) =>
+                        updatePayment("use_stripe_init", event.target.value)
+                      }
+                      className="control-surface control-surface-compact"
+                      title="用 accessToken 直接调 Stripe payment_pages/init 生成 pay.openai.com 长链（纯协议，不靠默认接口 url）"
                     >
                       <option value="false">{t("common.no")}</option>
                       <option value="true">{t("common.yes")}</option>

@@ -380,6 +380,8 @@ class ChatGPTPlatform(BasePlatform):
                   "options": ["plus", "team"]},
                  {"key": "auto_checkout", "label": "自动提交 PayPal", "type": "select",
                   "options": ["true", "false"]},
+                 {"key": "use_stripe_init", "label": "Stripe协议长链(accessToken直生成)", "type": "select",
+                  "options": ["false", "true"]},
                  {"key": "payment_method", "label": "支付方式", "type": "select",
                   "options": ["paypal"]},
                  {"key": "headless", "label": "后台模式", "type": "select",
@@ -654,6 +656,9 @@ class ChatGPTPlatform(BasePlatform):
         plan = params.get("plan", "plus")
         country = params.get("country", "ID")
         currency = params.get("currency") or None
+        # 用 Stripe payment_pages/init 协议生成 cashier_url（accessToken →
+        # pay.openai.com 长链，纯协议、不开浏览器拿 cashier 链）。仅 plus 生效。
+        use_stripe_init = _bool_param(params, "use_stripe_init", False)
         # 账单地址来源（meiguodizhi.com 接口）："US" 走 ``/``，"JP" 走 ``/jp-address``。
         # 默认 US 保持向下兼容；其它值在 fetch_billing_address 里 fallback US。
         address_region = str(params.get("address_region") or "US").strip().upper() or "US"
@@ -744,7 +749,14 @@ class ChatGPTPlatform(BasePlatform):
 
         getattr(self, "_log_fn", print)("生成 ChatGPT 测试支付链接不使用代理")
         if plan == "plus":
-            url = payment_module.generate_plus_link(a, proxy=None, country=country, currency=currency)
+            if use_stripe_init:
+                getattr(self, "_log_fn", print)(
+                    "cashier_url 走 Stripe init 协议长链（accessToken → pay.openai.com，纯协议）"
+                )
+            url = payment_module.generate_plus_link(
+                a, proxy=None, country=country, currency=currency,
+                use_stripe_init=use_stripe_init,
+            )
         else:
             url = payment_module.generate_team_link(a, proxy=None, country=country, currency=currency)
         self.raise_if_cancelled()

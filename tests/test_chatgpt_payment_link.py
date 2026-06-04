@@ -507,6 +507,10 @@ def test_generate_ctf_test_identity_uses_natural_random_values():
     assert identity["date_of_birth"] == payment_module.CTF_DATE_OF_BIRTH
 
 
+def test_ctf_date_of_birth_is_fixed_jp_year_first():
+    assert payment_module.CTF_DATE_OF_BIRTH == "1976/09/06"
+
+
 def test_hold_checkout_browser_exits_early_when_cancel_requested(monkeypatch):
     sleeps = []
 
@@ -8137,10 +8141,10 @@ def test_wait_and_type_dob_prefers_gujumpgate_style_js_setter():
         interval_ms=0,
         log=lambda _m: None,
     ) is True
-    assert state["js_sets"] == ["11/24/1990"]
+    assert state["js_sets"] == ["1990/11/24"]
     assert state["inserted"] == []
     assert state["typed"] == []
-    assert state["value"] == "11/24/1990"
+    assert state["value"] == "1990/11/24"
 
 
 def test_wait_and_type_dob_tries_compact_digits_when_mask_truncates_slashes():
@@ -8227,10 +8231,10 @@ def test_wait_and_type_dob_refocuses_before_each_keyboard_candidate():
 
         def insert_text(self, text):
             state["inserted"].append((state["active"], text))
-            if state["active"] == "dateOfBirth" and text == "09/05/1976":
-                state["values"]["dateOfBirth"] = "09/05/19"
-            elif state["active"] == "dateOfBirth" and text == "09051976":
-                state["values"]["dateOfBirth"] = "09/05/1976"
+            if state["active"] == "dateOfBirth" and text == "1976/09/06":
+                state["values"]["dateOfBirth"] = "1976/09/0"
+            elif state["active"] == "dateOfBirth" and text == "19760906":
+                state["values"]["dateOfBirth"] = "1976/09/06"
             else:
                 state["values"][state["active"]] = text
 

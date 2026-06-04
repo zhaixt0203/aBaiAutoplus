@@ -71,3 +71,7 @@ docs/REFACTOR-PLAN.md
 
 # 敏感文件
 *.har
+
+# Frida release/devkit binaries are too large for normal Git history.
+gopay-auto-protocol/**/frida-core-devkit-*/
+gopay-auto-protocol/**/frida-server-*

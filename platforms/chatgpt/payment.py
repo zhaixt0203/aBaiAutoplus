@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import parse_qs, unquote, urlparse
@@ -53,6 +54,27 @@ logger = logging.getLogger(__name__)
 PAYMENT_CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 TEAM_CHECKOUT_BASE_URL = "https://chatgpt.com/checkout/openai_llc/"
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+# ── Stripe payment_pages init（accessToken → 完整 pay.openai.com 长链）────
+# 移植自 gopay-auto-protocol/oaipayy/server.py：在拿到 OpenAI 的
+# checkout_session_id 后，显式调 Stripe ``/v1/payment_pages/{cs}/init`` 把
+# checkout 实体化成 ``checkout.stripe.com/c/pay/cs_...`` 的 hosted URL，再把
+# host 重写成 ``pay.openai.com`` 得到最终长链（cashier_url）。
+# 与默认的"直接用 OpenAI 响应里的 url"相比，这条路保证拿到带完整 ``#fid...``
+# 片段的长链，纯协议、不开浏览器。OpenAI 的 Stripe live publishable key
+# 是公开的（嵌在 checkout JS 里），仅在 OpenAI 响应没回 publishable_key 时兜底。
+DEFAULT_STRIPE_PK = (
+    "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRac"
+    "ViovU3kLKvpkjh7IqkW00iXQsjo3n"
+)
+DEFAULT_STRIPE_VERSION = (
+    "2025-03-31.basil; checkout_server_update_beta=v1; "
+    "checkout_manual_approval_preview=v1"
+)
+DEFAULT_STRIPE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
 WHAM_USAGE_USER_AGENT = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 MEIGUODIZHI_ADDRESS_URL = "https://www.meiguodizhi.com/api/v1/dz"
 CTF_RELAY_CODE_URL = "https://mail-api.yuecheng.shop/api/text-relay/eca_tr_gVilRnzkWFzslyX8lS9A5fwM"
@@ -67,7 +89,7 @@ CTF_CITY = "Albany"
 CTF_STATE = "NY"
 CTF_STATE_NAME = "New York"
 CTF_POSTAL_CODE = "12207"
-CTF_DATE_OF_BIRTH = "09/05/1976"
+CTF_DATE_OF_BIRTH = "1976/09/06"
 
 _CAMOUFOX_FINGERPRINT_LIMIT = 128
 _CAMOUFOX_FINGERPRINT_LOCK = threading.Lock()
@@ -5249,20 +5271,29 @@ def _wait_and_type_dob_by_id(
 
 
 def _is_complete_paypal_dob_value(value: object) -> bool:
-    return isinstance(value, str) and re.fullmatch(r"\d{2}/\d{2}/\d{4}", value or "") is not None
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"(?:\d{2}/\d{2}/\d{4}|\d{4}/\d{2}/\d{2})", value or "") is not None
+    )
 
 
 def _paypal_dob_input_candidates(dob_value: str) -> list[str]:
     normalized = _normalize_paypal_dob_value(dob_value)
     if not normalized:
         return [str(dob_value or "")]
-    month, day, year = normalized.split("/")
+    first, second, third = normalized.split("/")
+    if len(first) == 4:
+        year, month, day = first, second, third
+        no_padding = f"{year}/{int(month)}/{int(day)}"
+    else:
+        month, day, year = first, second, third
+        no_padding = f"{int(month)}/{int(day)}/{year}"
     return list(
         dict.fromkeys(
             [
                 normalized,
-                f"{month}{day}{year}",
-                f"{int(month)}/{int(day)}/{year}",
+                re.sub(r"\D", "", normalized),
+                no_padding,
             ]
         )
     )
@@ -5380,9 +5411,11 @@ def _normalize_paypal_dob_value(value: str) -> str:
         return ""
     parts = re.findall(r"\d+", raw)
     year = month = day = ""
+    year_first = False
     if len(parts) >= 3:
         first, second, third = parts[:3]
         if len(first) == 4:
+            year_first = True
             year, month, day = first, second, third
         else:
             month, day, year = first, second, third
@@ -5394,6 +5427,7 @@ def _normalize_paypal_dob_value(value: str) -> str:
         possible_month = int(digits[4:6])
         possible_day = int(digits[6:8])
         if 1900 <= possible_year <= 2099 and 1 <= possible_month <= 12 and 1 <= possible_day <= 31:
+            year_first = True
             year, month, day = digits[:4], digits[4:6], digits[6:8]
         else:
             month, day, year = digits[:2], digits[2:4], digits[4:8]
@@ -5405,6 +5439,8 @@ def _normalize_paypal_dob_value(value: str) -> str:
         return ""
     if not (1900 <= year_int <= 2099 and 1 <= month_int <= 12 and 1 <= day_int <= 31):
         return ""
+    if year_first:
+        return f"{year_int:04d}/{month_int:02d}/{day_int:02d}"
     return f"{month_int:02d}/{day_int:02d}/{year_int:04d}"
 
 
@@ -6016,15 +6052,13 @@ def _fill_ctf_payment_form(page, identity: dict, *, log: Callable[[str], None] |
         )
         # 出生日期（``#dateOfBirth``，``MM/DD/YYYY`` 文本格式；hosted form
         # 的输入掩码即便 JP 区也走美式 M/D/YYYY 布局）
-        _fill_checkout_field(
+        _wait_and_type_dob_by_id(
             page,
+            "dateOfBirth",
             CTF_DATE_OF_BIRTH,
-            selectors=(
-                '#dateOfBirth',
-                'input[name="dateOfBirth"]',
-                'input[id="dateOfBirth"]',
-            ),
-            labels=(),
+            log=log_fn,
+            attempts=4,
+            interval_ms=300,
         )
         # PayPal hosted 的账单字段命名（``billingState`` / ``billingPostalCode``
         # / ``billingCity`` / ``billingLine1`` / ``billingLine2``）跟 Stripe 不同；
@@ -8149,7 +8183,12 @@ def select_gopay_and_grab_midtrans(
         log("Camoufox 未配置代理（直连），印尼站点指纹/地理大概率过不了风控")
 
     browser_timeout_ms = max(int(timeout_seconds or 300), 30) * 1000
-    address = fetch_us_billing_address()
+    # GoPay 是印尼渠道：cashier 页 country=ID，省/州下拉是印尼省份
+    # （DKI Jakarta / Jawa Barat ...）。以前这里硬编 ``fetch_us_billing_address``
+    # 填的是 "New York" 这种美国州，印尼下拉永远匹配不上 → state 一直未命中
+    # （日志里 "账单字段填写结果 ... 未命中=state"）。改用印尼地址（DKI
+    # Jakarta + 10310 邮编）让 state option 能命中。
+    address = fetch_billing_address("ID")
 
     log(
         f"浏览器打开 cashier_url 选 GoPay 渠道（backend={backend_config.backend}, "
@@ -8341,13 +8380,82 @@ def _open_url_system_browser(url: str) -> bool:
     return False
 
 
+def _stripe_init_long_url(
+    cs_id: str,
+    publishable_key: str,
+    *,
+    payment_locale: str = "en",
+    user_agent: str = "",
+    proxy: Optional[str] = None,
+) -> str:
+    """用 Stripe ``payment_pages/{cs}/init`` 把 checkout_session 实体化成长链。
+
+    移植自 oaipayy/server.py 的 step2/step3：POST Stripe init 拿
+    ``stripe_hosted_url``（``checkout.stripe.com/c/pay/cs_...``），再把 host
+    重写成 ``pay.openai.com`` 返回最终 cashier_url。失败抛 ValueError。
+    """
+    pk = str(publishable_key or "").strip() or DEFAULT_STRIPE_PK
+    stripe_js_id = str(uuid.uuid4())
+    body = {
+        "browser_locale": "en-US",
+        "browser_timezone": "Asia/Shanghai",
+        "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
+        "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
+        "elements_session_client[elements_init_source]": "custom_checkout",
+        "elements_session_client[referrer_host]": "chatgpt.com",
+        "elements_session_client[stripe_js_id]": stripe_js_id,
+        "elements_session_client[locale]": str(payment_locale or "en"),
+        "elements_session_client[is_aggregation_expected]": "false",
+        "elements_options_client[saved_payment_method][enable_save]": "auto",
+        "elements_options_client[saved_payment_method][enable_redisplay]": "auto",
+        "key": pk,
+        "_stripe_version": DEFAULT_STRIPE_VERSION,
+    }
+    headers = {
+        "Authorization": f"Bearer {pk}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": user_agent or DEFAULT_STRIPE_UA,
+    }
+    resp = cffi_requests.post(
+        f"https://api.stripe.com/v1/payment_pages/{cs_id}/init",
+        data=body,
+        headers=headers,
+        proxies=_build_proxies(proxy),
+        timeout=30,
+        impersonate="chrome110",
+    )
+    if resp.status_code != 200:
+        raise ValueError(f"Stripe init 失败 HTTP {resp.status_code}: {resp.text[:300]}")
+    data = resp.json() if callable(getattr(resp, "json", None)) else {}
+    if not isinstance(data, dict):
+        data = {}
+    hosted = (
+        str(data.get("stripe_hosted_url") or "").strip()
+        or str(data.get("hosted_url") or "").strip()
+        or str(data.get("url") or "").strip()
+    )
+    if not hosted:
+        raise ValueError(f"Stripe init 响应没 hosted URL: {str(data)[:300]}")
+    if "checkout.stripe.com" not in hosted:
+        # host 不是预期的 checkout.stripe.com，不重写，原样返回（仍可用）
+        return hosted
+    return hosted.replace("checkout.stripe.com", "pay.openai.com")
+
+
 def generate_plus_link(
     account: Account,
     proxy: Optional[str] = None,
     country: str = "ID",
     currency: str | None = None,
+    use_stripe_init: bool = False,
 ) -> str:
-    """生成 Plus 支付链接（后端携带账号 cookie 发请求）"""
+    """生成 Plus 支付链接（后端携带账号 cookie 发请求）。
+
+    ``use_stripe_init=True`` 时走 oaipayy 协议：拿到 OpenAI 的
+    ``checkout_session_id`` 后，显式调 Stripe ``payment_pages/{cs}/init`` 把
+    checkout 实体化成完整 ``pay.openai.com`` 长链（纯协议、不开浏览器，长链
+    更稳）。默认 False 时沿用原行为（直接用 OpenAI 响应里的 url）。
+    """
     if not account.access_token:
         raise ValueError("账号缺少 access_token")
 
@@ -8385,10 +8493,23 @@ def generate_plus_link(
     )
     resp.raise_for_status()
     data = resp.json()
-    url = _extract_checkout_url(data if isinstance(data, dict) else {})
+    data = data if isinstance(data, dict) else {}
+
+    if use_stripe_init:
+        cs_id = (
+            str(data.get("checkout_session_id") or "").strip()
+            or str(data.get("cs_id") or "").strip()
+        )
+        if not cs_id:
+            raise ValueError(f"OpenAI 响应没 checkout_session_id（无法 Stripe init）: {str(data)[:300]}")
+        pk = str(data.get("publishable_key") or "").strip()
+        logger.info("generate_plus_link: 走 Stripe init 协议长链 cs_id=%s", cs_id)
+        return _stripe_init_long_url(cs_id, pk, proxy=proxy)
+
+    url = _extract_checkout_url(data)
     if url:
         return url
-    raise ValueError((data if isinstance(data, dict) else {}).get("detail", "API 未返回 checkout URL"))
+    raise ValueError(data.get("detail", "API 未返回 checkout URL"))
 
 
 def generate_team_link(

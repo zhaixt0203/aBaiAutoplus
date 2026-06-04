@@ -586,9 +586,10 @@ def patch_worker_with_smsapi(*, url: str, phone: str) -> None:
 # ---------------------------------------------------------------------------
 
 HEROSMS_REBIND_API = "https://hero-sms.com/stubs/handler_api.php"
-# 换绑目标号默认买泰国（country=52），service=ni（与参考 gopay换绑.txt 一致）。
-# 只为占位释放旧印尼号，越便宜越好，可用 env / 参数覆盖。
-HEROSMS_REBIND_DEFAULT_COUNTRY = os.environ.get("OPAI_REBIND_COUNTRY", "52")
+# 换绑目标号默认买**印尼**（country=6），service=ni（Gojek/GoPay）。
+# 换绑后的新号要继续用于下一轮 GoPay 支付，必须是印尼号（+62），所以这里
+# 固定印尼，不再用泰国便宜号（外国号换绑后没法接着付款）。可用 env / 参数覆盖。
+HEROSMS_REBIND_DEFAULT_COUNTRY = os.environ.get("OPAI_REBIND_COUNTRY", "6")
 HEROSMS_REBIND_DEFAULT_SERVICE = os.environ.get("OPAI_REBIND_SERVICE", "ni")
 
 
@@ -600,8 +601,9 @@ def make_herosms_rebind_channel(
 ) -> SmsActivateStyleChannel:
     """构造换绑用的 Hero-SMS 渠道（买外国临时号接换绑 OTP）。
 
-    与 GoPay 注册渠道独立：换绑只是为了把账号迁到一个新号上，从而释放
-    当前占用的印尼号。新号买最便宜的外国号即可（默认泰国）。
+    与 GoPay 注册渠道独立：换绑把账号从旧印尼号迁到一个**新印尼号**上。
+    换绑后的新号要继续用于下一轮 GoPay 支付，所以必须是印尼号（+62 / country=6），
+    不能用外国便宜号。
     """
     return SmsActivateStyleChannel(
         base_url=HEROSMS_REBIND_API,

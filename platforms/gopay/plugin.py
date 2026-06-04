@@ -171,24 +171,16 @@ class GoPayPlatform(BasePlatform):
         super().__init__(config)
 
     # ------------------------------------------------------------------
-    # 关键：覆写 register() 跳过 identity 解析
+    # SMS 接码渠道配置（register / 换绑获号 共用）
     # ------------------------------------------------------------------
-    def register(self, email: str = None, password: str = None) -> Account:
-        ensure_opai_on_path()
-        from opai.core.gopay_protocol_worker import _register_one
+    def _setup_sms_channel(self, extra: dict, sms_provider: str, proxy: str,
+                           pin: str, *, action: str = "注册") -> str:
+        """按 ``sms_provider`` patch worker 的 sms 函数，返回 api_key。
 
-        extra = dict(self.config.extra or {})
-        # 接码渠道：herosms（默认）/ smspool / smsbower
-        sms_provider = str(extra.get("sms_provider") or "herosms").strip().lower()
-        pin = _resolve_pin(extra)
-        if not (pin.isdigit() and len(pin) == 6):
-            raise RuntimeError(f"GoPay PIN 必须是 6 位数字（当前: {pin!r}）")
-
-        proxy = _resolve_proxy(extra, self.config.proxy)
-        # ``envelope_did`` 来自 ``opai-team`` 自家的 Payment Inbox 服务，
-        # 我们这边只做注册，不依赖那套服务，传空串即可（注册流程不强需要它）。
-        envelope_did = ""
-
+        ``register()``（注册新号）和 ``acquire_via_rebind()``（成熟号换绑到新号）
+        都要从接码渠道拿号 / 接 OTP，所以共用这套渠道配置。``action`` 只用于
+        日志区分（"注册" / "换绑获号"）。
+        """
         if sms_provider == "smspool":
             from platforms.gopay.sms_channel import (
                 patch_worker_with_smspool,
@@ -208,11 +200,9 @@ class GoPayPlatform(BasePlatform):
                 max_price=str(extra.get("smspool_max_price") or ""),
                 pricing_option=str(extra.get("smspool_pricing_option") or ""),
             )
-            # smspool channel 自带 key；传给 _register_one 的 api_key 不再用，
-            # 但保持非空避免上游某些早退判断。
             api_key = smspool_key
             self.log(
-                f"GoPay 协议注册启动（接码=SMSPool, PIN={pin[:2]}**, proxy={proxy or '直连'}）"
+                f"GoPay 协议{action}启动（接码=SMSPool, PIN={pin[:2]}**, proxy={proxy or '直连'}）"
             )
         elif sms_provider == "smsbower":
             from platforms.gopay.sms_channel import (
@@ -232,7 +222,7 @@ class GoPayPlatform(BasePlatform):
             )
             api_key = smsbower_key
             self.log(
-                f"GoPay 协议注册启动（接码=SMSBower, PIN={pin[:2]}**, proxy={proxy or '直连'}）"
+                f"GoPay 协议{action}启动（接码=SMSBower, PIN={pin[:2]}**, proxy={proxy or '直连'}）"
             )
         elif sms_provider == "smsapi":
             from platforms.gopay.sms_channel import (
@@ -258,10 +248,9 @@ class GoPayPlatform(BasePlatform):
                     "或设环境变量 OPAI_SMSAPI_PHONE / OPAI_SMSAPI_URL"
                 )
             patch_worker_with_smsapi(url=smsapi_url, phone=smsapi_phone)
-            # smsapi channel 自带号+URL；api_key 不再用，保持非空避免上游早退。
             api_key = "smsapi"
             self.log(
-                f"GoPay 协议注册启动（接码=SmsApi 固定号 {smsapi_phone}, "
+                f"GoPay 协议{action}启动（接码=SmsApi 固定号 {smsapi_phone}, "
                 f"PIN={pin[:2]}**, proxy={proxy or '直连'}）"
             )
         else:
@@ -271,15 +260,121 @@ class GoPayPlatform(BasePlatform):
                     "GoPay 注册需要 Hero-SMS API key —— 请在注册任务 extra 里"
                     "填 herosms_api_key，或设置环境变量 OPAI_HEROSMS_API_KEY"
                 )
-            # 给 Hero-SMS getNumber 加 maxPrice 上限（默认 0.011 USD）。
-            # 注意：必须在 ``_register_one`` 调用前 patch，因为 _register_one
-            # 内部会立即调 sms_get_number 拿号。
+            # 给 Hero-SMS getNumber 加 maxPrice 上限。必须在拿号前 patch。
             max_price_usd = _resolve_max_price_usd(extra)
             _patch_sms_get_number_with_max_price(max_price_usd)
             self.log(
-                f"GoPay 协议注册启动（接码=Hero-SMS, PIN={pin[:2]}**, "
+                f"GoPay 协议{action}启动（接码=Hero-SMS, PIN={pin[:2]}**, "
                 f"proxy={proxy or '直连'}, maxPrice={_format_max_price(max_price_usd)} USD）"
             )
+        return api_key
+
+    # ------------------------------------------------------------------
+    # 换绑获号：成熟老账号改绑到新号（绕开新号秒付被风控拒）
+    # ------------------------------------------------------------------
+    def acquire_via_rebind(self) -> Account:
+        """用一个成熟老账号改绑到新拿的未注册号，返回绑定了老账号身份的新号。
+
+        用户验证过的正确方向：服务端风控判账号不判手机号，新注册号秒付会被
+        FDS 拒。所以拿成熟老账号（json 池里 refresh_token 活的）改绑到干净
+        新号，用新号 + 老账号身份进支付流程。
+
+        和 ``register()`` 的区别：register 是从零注册一个全新账号；这里是
+        复用既有成熟账号、只把它的手机号换成新号。
+        """
+        ensure_opai_on_path()
+        from opai.core.gopay_protocol_worker import _acquire_via_mature_rebind
+
+        extra = dict(self.config.extra or {})
+        sms_provider = str(extra.get("sms_provider") or "herosms").strip().lower()
+        pin = _resolve_pin(extra)
+        if not (pin.isdigit() and len(pin) == 6):
+            raise RuntimeError(f"GoPay PIN 必须是 6 位数字（当前: {pin!r}）")
+        proxy = _resolve_proxy(extra, self.config.proxy)
+
+        api_key = self._setup_sms_channel(extra, sms_provider, proxy, pin, action="换绑获号")
+        self.raise_if_cancelled()
+
+        opai_logger = logging.getLogger("opai")
+        prev_level = opai_logger.level
+        bridge = _WorkerLogBridge(self.log)
+        opai_logger.addHandler(bridge)
+        if prev_level > logging.INFO or prev_level == logging.NOTSET:
+            opai_logger.setLevel(logging.INFO)
+        try:
+            result = _acquire_via_mature_rebind(api_key, pin, proxy)
+        finally:
+            opai_logger.removeHandler(bridge)
+            opai_logger.setLevel(prev_level)
+
+        if not result:
+            reason = (bridge.last_error.strip() if bridge else "")
+            raise RuntimeError(
+                f"换绑获号失败：{reason}" if reason
+                else "换绑获号失败：没有可用成熟号 / 新号拿号失败 / 换绑被拒，详见日志"
+            )
+
+        phone = str(result.get("phone") or "").strip()
+        local = str(result.get("local") or "").strip()
+        aid = str(result.get("aid") or "").strip()
+        acct_pin = str(result.get("pin") or pin).strip()
+        if not phone:
+            raise RuntimeError("换绑获号返回了空手机号，状态异常")
+
+        balance_rp = self._safe_initial_balance(result.get("client"))
+        self.log(
+            f"换绑获号成功: {phone}（aid={aid} 保留给付款 OTP, balance={balance_rp} IDR）"
+        )
+        return Account(
+            platform=self.name,
+            email=phone,
+            password=acct_pin,
+            user_id=phone,
+            region="ID",
+            token=local,
+            status=AccountStatus.REGISTERED,
+            extra={
+                "phone": phone,
+                "phone_local": local,
+                "country_code": "+62",
+                "pin": acct_pin,
+                "herosms_activation_id": aid,
+                "sms_provider": sms_provider,
+                "register_proxy": proxy,
+                "balance_rp": balance_rp,
+                "acquired_via": "mature_rebind",
+                "account_overview": {
+                    "balance_rp": balance_rp,
+                    "phone": phone,
+                    "phone_local": local,
+                    "pin": acct_pin,
+                    "herosms_activation_id": aid,
+                    "sms_provider": sms_provider,
+                    "acquired_via": "mature_rebind",
+                },
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # 关键：覆写 register() 跳过 identity 解析
+    # ------------------------------------------------------------------
+    def register(self, email: str = None, password: str = None) -> Account:
+        ensure_opai_on_path()
+        from opai.core.gopay_protocol_worker import _register_one
+
+        extra = dict(self.config.extra or {})
+        # 接码渠道：herosms（默认）/ smspool / smsbower
+        sms_provider = str(extra.get("sms_provider") or "herosms").strip().lower()
+        pin = _resolve_pin(extra)
+        if not (pin.isdigit() and len(pin) == 6):
+            raise RuntimeError(f"GoPay PIN 必须是 6 位数字（当前: {pin!r}）")
+
+        proxy = _resolve_proxy(extra, self.config.proxy)
+        # ``envelope_did`` 来自 ``opai-team`` 自家的 Payment Inbox 服务，
+        # 我们这边只做注册，不依赖那套服务，传空串即可（注册流程不强需要它）。
+        envelope_did = ""
+
+        api_key = self._setup_sms_channel(extra, sms_provider, proxy, pin, action="注册")
 
         self.raise_if_cancelled()
 
@@ -361,6 +456,19 @@ class GoPayPlatform(BasePlatform):
         if not phone:
             raise RuntimeError("GoPay 注册返回了空手机号，状态异常")
 
+        # 号已注册→登录换绑到新印尼号的场景：付款 OTP 要从**换绑渠道的新号**接，
+        # 不是注册渠道。worker 在 result 里透传了 rebind_provider/rebind_sms_key，
+        # 这里据此把账号的 sms_provider 覆写成换绑渠道。
+        eff_sms_provider = sms_provider
+        rebind_provider_used = str(result.get("rebind_provider") or "").strip().lower()
+        rebind_sms_key_used = str(result.get("rebind_sms_key") or "").strip()
+        if rebind_provider_used:
+            eff_sms_provider = rebind_provider_used
+            self.log(
+                f"该号已注册→已登录换绑到新印尼号 {phone}；付款将用换绑渠道"
+                f"（{eff_sms_provider}）接新号 OTP（aid={aid}）"
+            )
+
         # **重要**：不要调 sms_done(aid)！
         # GoPay 整个生命周期需要 3 次 OTP（注册 / PIN / 付款），全部
         # 复用同一个 Hero-SMS aid（通过 setStatus=3 让平台等下一条 SMS）。
@@ -395,9 +503,12 @@ class GoPayPlatform(BasePlatform):
                 # 注册用的接码渠道。付款阶段（步骤 ③）必须用**同一个渠道**
                 # 接 OTP——aid 对 SMSPool 来说是 order_id，拿去 Hero-SMS 查
                 # 永远等不到 OTP。所以这里记下渠道，付款时据此选 API。
-                "sms_provider": sms_provider,
+                "sms_provider": eff_sms_provider,
                 "register_proxy": proxy,
                 "balance_rp": balance_rp,
+                # 换绑获号场景：付款接码用的 key（换绑渠道独立 key，可空回退 env）。
+                # 不放 overview（避免前端泄漏全局 key）。
+                "rebind_sms_key": rebind_sms_key_used,
                 # ``save_account`` -> ``sync_platform_account_graph`` 只把
                 # ``account_overview`` 这层映射进 AccountOverviewModel.summary，
                 # 顶层字段不会同步。所以再把和"号本身状态"相关的字段
@@ -413,7 +524,7 @@ class GoPayPlatform(BasePlatform):
                     "phone_local": local,
                     "pin": pin,
                     "herosms_activation_id": aid,
-                    "sms_provider": sms_provider,
+                    "sms_provider": eff_sms_provider,
                 },
             },
         )

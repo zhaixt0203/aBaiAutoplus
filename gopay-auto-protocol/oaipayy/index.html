@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>本地支付长链生成器</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f4f6f8; --panel: #ffffff; --ink: #161b22; --muted: #667085;
+        --line: #d9dee7; --soft: #eef3f7; --accent: #087443; --accent-dark: #075f38;
+        --blue: #155eef; --danger: #b42318;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "Microsoft YaHei", sans-serif;
+      }
+      main { width: min(980px, calc(100vw - 32px)); margin: 0 auto; padding: 36px 0; }
+      header { display: flex; justify-content: space-between; gap: 20px; align-items: end; margin-bottom: 16px; }
+      h1 { margin: 0 0 8px; font-size: 30px; line-height: 1.15; }
+      p { margin: 0; color: var(--muted); line-height: 1.55; }
+      .stats { display: grid; grid-template-columns: repeat(3, minmax(92px, 1fr)); gap: 8px; min-width: 320px; }
+      .stat { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+      .stat strong { display: block; font-size: 18px; }
+      .stat span { color: var(--muted); font-size: 12px; }
+      .tool { display: grid; grid-template-columns: 1fr; gap: 16px; padding: 18px;
+        background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+      label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 700; }
+      textarea, input, select {
+        width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 6px;
+        background: #fff; color: var(--ink); font: inherit; padding: 10px 12px; outline: none;
+      }
+      textarea { min-height: 180px; resize: vertical; }
+      textarea:focus, input:focus, select:focus {
+        border-color: var(--accent); box-shadow: 0 0 0 3px rgba(8, 116, 67, 0.14);
+      }
+      .token-meta { min-height: 22px; color: var(--muted); font-size: 13px; }
+      .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+      details { border-top: 1px solid var(--line); padding-top: 12px; }
+      summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+      .actions, .result-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      button, a.button {
+        display: inline-flex; align-items: center; justify-content: center;
+        min-height: 42px; border: 0; border-radius: 6px; padding: 0 16px;
+        background: var(--accent); color: white; font: inherit; font-weight: 800;
+        text-decoration: none; cursor: pointer;
+      }
+      button:hover, a.button:hover { background: var(--accent-dark); }
+      button.secondary, a.button.secondary { background: var(--soft); color: var(--ink); }
+      button.secondary:hover, a.button.secondary:hover { background: #e1e8ee; }
+      a.button.blue { background: var(--blue); }
+      a.button.blue:hover { background: #114ac0; }
+      button:disabled, a.button.disabled { pointer-events: none; cursor: wait; opacity: 0.62; }
+      .status { min-height: 24px; color: var(--muted); font-size: 14px; }
+      .status.error { color: var(--danger); }
+      .result { display: none; margin-top: 2px; padding: 14px; border: 1px solid var(--line);
+        border-radius: 8px; background: #fbfcfd; }
+      .result.show { display: grid; gap: 12px; }
+      .row { display: grid; gap: 6px; }
+      code {
+        display: block; overflow-wrap: anywhere; padding: 12px; border-radius: 6px;
+        background: var(--soft); color: #101828; line-height: 1.45; font-size: 13px;
+      }
+      .step-log {
+        font-size: 12px; color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        max-height: 200px; overflow-y: auto; background: #f6f8fa; padding: 8px 10px;
+        border-radius: 6px; border: 1px solid var(--line);
+      }
+      .step-log .ok { color: var(--accent); }
+      .step-log .err { color: var(--danger); }
+      .step-log .dim { color: var(--muted); }
+      .badge { display: inline-block; padding: 2px 8px; border-radius: 999px;
+        font-size: 11px; font-weight: 700; background: var(--soft); color: var(--muted); }
+      .badge.live { background: #e6f4ec; color: var(--accent); }
+      @media (max-width: 840px) {
+        main { width: min(100vw - 24px, 980px); padding: 24px 0; }
+        header { display: grid; align-items: start; }
+        h1 { font-size: 25px; }
+        .stats { min-width: 0; width: 100%; }
+        .grid { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>本地支付长链生成器 <span class="badge live">server-side</span></h1>
+          <p>OpenAI + Stripe init 全在后端跑，浏览器只填 token、收 long_url、自己付。</p>
+        </div>
+        <div class="stats">
+          <div class="stat"><strong>本地</strong><span>Token 不出本机</span></div>
+          <div class="stat"><strong>长链</strong><span>pay.openai.com</span></div>
+          <div class="stat"><strong>Plus</strong><span>hosted</span></div>
+        </div>
+      </header>
+
+      <section class="tool">
+        <div>
+          <label for="accessToken">Access Token 或 session JSON</label>
+          <textarea id="accessToken" autocomplete="off" spellcheck="false"
+            placeholder="eyJ...（JWT）或 {accessToken: ...}（整个 session JSON）"></textarea>
+          <div id="tokenMeta" class="token-meta"></div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <label for="linkType">链类型</label>
+            <select id="linkType">
+              <option value="hosted" selected>支付长链（默认美国）</option>
+              <option value="paypal">PP 链提取（日本地址）</option>
+              <option value="gopay">GoPay 链提取（印尼地址）</option>
+            </select>
+          </div>
+          <div>
+            <label for="paymentLocale">支付页语言</label>
+            <select id="paymentLocale">
+              <option value="en" selected>英文</option>
+              <option value="zh-CN">简体中文</option>
+              <option value="zh-TW">繁体中文</option>
+              <option value="ja">日文</option>
+              <option value="ko">韩文</option>
+              <option value="de">德文</option>
+              <option value="fr">法文</option>
+              <option value="es">西班牙文</option>
+              <option value="id">印尼文</option>
+              <option value="pt-BR">葡萄牙文</option>
+            </select>
+          </div>
+          <div>
+            <label for="billingCountry">地区</label>
+            <select id="billingCountry"></select>
+          </div>
+          <div>
+            <label for="currency">币种</label>
+            <input id="currency" readonly />
+          </div>
+        </div>
+
+        <div>
+          <label for="proxy">出口代理（直连 chatgpt.com 不通时填，例如 http://127.0.0.1:7890）</label>
+          <input id="proxy" placeholder="留空 = 直连；填了 = 走后端代理" />
+        </div>
+
+        <details>
+          <summary>高级选项</summary>
+          <div class="grid">
+            <div>
+              <label for="stripeKey">Stripe PK（留空用 OpenAI 响应里的）</label>
+              <input id="stripeKey" placeholder="pk_live_..." />
+            </div>
+            <div>
+              <label for="userAgent">User Agent</label>
+              <input id="userAgent" placeholder="留空用默认 Chrome UA" />
+            </div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button id="generate" type="button">生成支付长链</button>
+          <span id="status" class="status">就绪。</span>
+        </div>
+
+        <div class="row">
+          <label>步骤日志</label>
+          <pre id="stepLog" class="step-log"></pre>
+        </div>
+
+        <div id="result" class="result">
+          <div class="result-actions">
+            <a id="openLink" class="button blue disabled" target="_blank" rel="noopener">跳转长链</a>
+            <button id="copy" class="secondary" type="button" disabled>复制长链</button>
+          </div>
+          <div class="row">
+            <label>长链（long_url）</label>
+            <code id="longUrl"></code>
+          </div>
+          <div class="row">
+            <label>CS ID / 地区 / 币种</label>
+            <code id="summary"></code>
+          </div>
+          <div class="row">
+            <label>Stripe 原始 hosted URL</label>
+            <code id="stripeUrl"></code>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const COUNTRIES = [
+        ["US","美国 US","USD"],["GB","英国 GB","GBP"],["CA","加拿大 CA","CAD"],
+        ["AU","澳大利亚 AU","AUD"],["JP","日本 JP","JPY"],["SG","新加坡 SG","SGD"],
+        ["HK","中国香港 HK","HKD"],["TW","中国台湾 TW","TWD"],["KR","韩国 KR","KRW"],
+        ["ID","印度尼西亚 ID","IDR"],["MY","马来西亚 MY","MYR"],["TH","泰国 TH","THB"],
+        ["VN","越南 VN","VND"],["PH","菲律宾 PH","PHP"],["IN","印度 IN","INR"],
+        ["DE","德国 DE","EUR"],["FR","法国 FR","EUR"],["IT","意大利 IT","EUR"],
+        ["ES","西班牙 ES","EUR"],["NL","荷兰 NL","EUR"],["IE","爱尔兰 IE","EUR"],
+        ["PT","葡萄牙 PT","EUR"],["BE","比利时 BE","EUR"],["FI","芬兰 FI","EUR"],
+        ["AT","奥地利 AT","EUR"],["CH","瑞士 CH","CHF"],["SE","瑞典 SE","SEK"],
+        ["NO","挪威 NO","NOK"],["DK","丹麦 DK","DKK"],["PL","波兰 PL","PLN"],
+        ["CZ","捷克 CZ","CZK"],["MX","墨西哥 MX","MXN"],["BR","巴西 BR","BRL"],
+        ["NZ","新西兰 NZ","NZD"],
+      ];
+      const LOCKED_COUNTRY_BY_TYPE = { hosted: "US", paypal: "JP", gopay: "ID" };
+      const $ = (id) => document.getElementById(id);
+      const K = { token: "oaipc_token", proxy: "oaipc_proxy" };
+
+      function saveLocal() {
+        localStorage.setItem(K.token, $("accessToken").value.trim());
+        localStorage.setItem(K.proxy, $("proxy").value.trim());
+      }
+      function loadLocal() {
+        $("accessToken").value = localStorage.getItem(K.token) || "";
+        $("proxy").value = localStorage.getItem(K.proxy) || "";
+      }
+
+      function setStatus(text, isError = false) {
+        const s = $("status");
+        s.textContent = text;
+        s.classList.toggle("error", isError);
+      }
+      function logStep(text, kind = "dim") {
+        const pre = $("stepLog");
+        const t = new Date().toLocaleTimeString();
+        pre.innerHTML += `<span class="${kind}">[${t}] ${text}</span>\n`;
+        pre.scrollTop = pre.scrollHeight;
+      }
+      function clearLog() { $("stepLog").innerHTML = ""; }
+      function setLinkEnabled(enabled, url = "") {
+        $("copy").disabled = !enabled;
+        const a = $("openLink");
+        a.classList.toggle("disabled", !enabled);
+        a.href = enabled ? url : "";
+      }
+
+      // JWT / session JSON 解析
+      function base64UrlDecode(v) {
+        const n = v.replace(/-/g, "+").replace(/_/g, "/");
+        const p = n + "=".repeat((4 - (n.length % 4)) % 4);
+        return decodeURIComponent(atob(p).split("").map(c =>
+          "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2)).join(""));
+      }
+      function findToken(v) {
+        if (!v) return "";
+        if (typeof v === "string") return v.trim();
+        if (Array.isArray(v)) { for (const x of v) { const t = findToken(x); if (t) return t; } }
+        if (typeof v === "object") {
+          for (const k of ["accessToken", "access_token", "token"])
+            if (typeof v[k] === "string" && v[k].trim()) return v[k].trim();
+          for (const x of Object.values(v)) { const t = findToken(x); if (t) return t; }
+        }
+        return "";
+      }
+      function readAccessToken() {
+        const raw = $("accessToken").value.trim();
+        if (!raw) return "";
+        if (raw.startsWith("{") || raw.startsWith("[")) {
+          try { return findToken(JSON.parse(raw)) || raw; } catch { return raw; }
+        }
+        return raw;
+      }
+      function updateTokenMeta() {
+        const token = readAccessToken();
+        if (!token.includes(".")) { $("tokenMeta").textContent = ""; return; }
+        try {
+          const payload = JSON.parse(base64UrlDecode(token.split(".")[1] || ""));
+          const profile = payload["https://api.openai.com/profile"] || {};
+          const email = profile.email || payload.email || "";
+          $("tokenMeta").textContent = email ? `已识别 token，邮箱：${email}` : "已识别 token";
+        } catch { $("tokenMeta").textContent = ""; }
+      }
+
+      function fillCountries() {
+        const sel = $("billingCountry");
+        sel.innerHTML = "";
+        for (const [code, label] of COUNTRIES) {
+          const o = document.createElement("option");
+          o.value = code; o.textContent = label;
+          if (code === "US") o.selected = true;
+          sel.appendChild(o);
+        }
+      }
+      function updateCurrency() {
+        const sel = COUNTRIES.find(([c]) => c === $("billingCountry").value);
+        $("currency").value = sel ? sel[2] : "USD";
+      }
+      function updateLockedCountry() {
+        const linkType = $("linkType").value;
+        if (linkType === "hosted") {
+          $("billingCountry").disabled = false;
+          if (!$("billingCountry").value) $("billingCountry").value = "US";
+        } else {
+          $("billingCountry").value = LOCKED_COUNTRY_BY_TYPE[linkType] || "US";
+          $("billingCountry").disabled = true;
+        }
+        updateCurrency();
+        $("generate").textContent =
+          linkType === "paypal" ? "提取 PP 链" :
+          linkType === "gopay" ? "提取 GoPay 链" : "生成支付长链";
+      }
+
+      async function generate() {
+        const token = readAccessToken();
+        if (!token) return setStatus("Access Token 不能为空。", true);
+
+        $("generate").disabled = true;
+        $("result").classList.remove("show");
+        setLinkEnabled(false);
+        clearLog();
+        setStatus("调后端...");
+        saveLocal();
+
+        logStep("→ POST /api/long-link", "dim");
+        logStep(`  link_type = ${$("linkType").value}`, "dim");
+        logStep(`  country   = ${$("billingCountry").value}`, "dim");
+        logStep(`  locale    = ${$("paymentLocale").value}`, "dim");
+        logStep(`  proxy     = ${$("proxy").value.trim() || "(直连)"}`, "dim");
+
+        try {
+          const r = await fetch("/api/long-link", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              accessToken: token,
+              link_type: $("linkType").value,
+              billing_country: $("billingCountry").value,
+              checkout_ui_mode: "hosted",
+              payment_locale: $("paymentLocale").value,
+              stripe_publishable_key: $("stripeKey").value.trim(),
+              user_agent: $("userAgent").value.trim(),
+              proxy: $("proxy").value.trim(),
+            }),
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+
+          logStep(`Step 1 OK, cs_id = ${data.cs_id}`, "ok");
+          logStep(`Step 2 OK, hosted = ${data.stripe_hosted_url.slice(0, 60)}…`, "ok");
+          logStep(`Step 3 OK, long_url = ${data.long_url}`, "ok");
+
+          $("longUrl").textContent = data.long_url;
+          $("summary").textContent = `${data.cs_id} / ${data.billing_country} / ${data.currency} / ${data.link_type}`;
+          $("stripeUrl").textContent = data.stripe_hosted_url;
+          $("result").classList.add("show");
+          setLinkEnabled(true, data.long_url);
+          setStatus("生成完成 ✅");
+        } catch (e) {
+          setStatus(e instanceof Error ? e.message : String(e), true);
+          logStep("❌ " + (e.message || e), "err");
+          console.error(e);
+        } finally {
+          $("generate").disabled = false;
+        }
+      }
+
+      async function copyLink() {
+        const url = $("longUrl").textContent;
+        if (!url) return;
+        try {
+          await navigator.clipboard.writeText(url);
+          setStatus("已复制 ✅");
+        } catch (e) {
+          setStatus("复制失败: " + e.message, true);
+        }
+      }
+
+      // Init
+      fillCountries();
+      loadLocal();
+      updateLockedCountry();
+      updateCurrency();
+      updateTokenMeta();
+
+      $("accessToken").addEventListener("input", () => { updateTokenMeta(); saveLocal(); });
+      $("proxy").addEventListener("input", saveLocal);
+      $("linkType").addEventListener("change", updateLockedCountry);
+      $("billingCountry").addEventListener("change", updateCurrency);
+      $("generate").addEventListener("click", generate);
+      $("copy").addEventListener("click", copyLink);
+    </script>
+  </body>
+</html>
